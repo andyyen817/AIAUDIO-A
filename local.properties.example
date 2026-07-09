@@ -1,0 +1,3 @@
+# Copy this file to local.properties if Android Studio does not detect your SDK.
+# Do not commit local.properties because it contains a machine-specific path.
+sdk.dir=/path/to/Android/Sdk

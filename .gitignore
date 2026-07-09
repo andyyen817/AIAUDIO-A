@@ -1,0 +1,67 @@
+# Gradle / Android build outputs
+.gradle/
+build/
+**/build/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Android Studio / IDE
+.idea/
+*.iml
+.vscode/
+
+# Local machine configuration
+local.properties
+keystore.properties
+
+# App packages
+*.apk
+*.aab
+
+# Signing keys and secrets
+*.jks
+*.keystore
+*.pem
+*.key
+.env
+.env.*
+secrets/
+credentials/
+
+# Runtime recordings and generated business output
+Incoming/
+recordings/
+uploads/
+Transcripts/
+transcripts/
+outputs/
+
+# Audio files are excluded by default, except the tiny bundled test fixture.
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.aac
+*.ogg
+!app/src/main/assets/test.wav
+
+# Temporary / cache / logs / local databases
+*.part
+*.tmp
+*.log
+*.cache
+*.db
+*.sqlite
+*.sqlite3
+
+# Downloaded archives / extracted setup cache
+downloads/
+
+# Duplicate native-library cache for the local sherpa_onnx module.
+# Runtime libraries required by the APK are kept under app/src/main/jniLibs/.
+sherpa_onnx/src/main/jniLibs/
+
+# OS files
+.DS_Store
+Thumbs.db
