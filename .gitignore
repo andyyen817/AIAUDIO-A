@@ -47,6 +47,10 @@ outputs/
 !app/src/main/assets/test.wav
 
 # Temporary / cache / logs / local databases
+__pycache__/
+*.pyc
+.venv/
+venv/
 *.part
 *.tmp
 *.log

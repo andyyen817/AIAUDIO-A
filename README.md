@@ -73,6 +73,73 @@ Use JDK 17 for local builds.
 
 The debug package uses the `.vadtest` application id suffix.
 
+## Zeabur Deployment
+
+This repository also contains a minimal server entrypoint for Zeabur. It is
+separate from the Android APK. Zeabur should build the root `Dockerfile`, which
+runs a FastAPI upload receiver on port `8080`.
+
+Endpoints:
+
+```text
+GET  /health
+POST /api/airec/upload
+```
+
+`POST /api/airec/upload` accepts AIREC-style multipart form data:
+
+```text
+file      WAV file, required
+fileName  yyyyMMddHHmmss.wav, required
+sn        device serial number, required
+```
+
+Files are saved under:
+
+```text
+${INCOMING_DIR}/{sn}/{fileName}
+```
+
+Default:
+
+```text
+/data/lightasr/incoming
+```
+
+Recommended Zeabur environment variables:
+
+```text
+PORT=8080
+INCOMING_DIR=/data/lightasr/incoming
+DATABASE_URL=<Zeabur PostgreSQL connection string>
+ALLOW_ALL_SN=true
+```
+
+For production, set `ALLOW_ALL_SN=false` and configure:
+
+```text
+AUTHORIZED_SN=DEVICE_SN_123456,DEVICE_SN_789
+```
+
+Local server test:
+
+```powershell
+docker build -t lightasr-upload .
+docker run --rm -p 8080:8080 lightasr-upload
+```
+
+Upload test:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8080/api/airec/upload `
+  -F "file=@C:\path\to\20260522120423.wav;type=audio/wav" `
+  -F "fileName=20260522120423.wav" `
+  -F "sn=DEVICE_SN_123456"
+```
+
+The server returns HTTP 200 with `ok` when the upload is saved or when the same
+`sn + fileName` has already been uploaded.
+
 ## Notes
 
 Generated APKs, build directories, downloaded archives, real recordings,
