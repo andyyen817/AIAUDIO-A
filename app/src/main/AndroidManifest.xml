@@ -15,6 +15,10 @@
             android:name=".AirecReceiverService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".TranscriptionForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
 
         <activity
             android:name=".MainActivity"

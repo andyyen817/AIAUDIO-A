@@ -4,6 +4,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 ENV INCOMING_DIR=/data/lightasr/incoming
+ENV RECORDINGS_DIR=/data/lightasr/recordings
 
 WORKDIR /app
 
@@ -12,7 +13,9 @@ RUN pip install --no-cache-dir -r /app/server/requirements.txt
 
 COPY server/ /app/server/
 
-RUN mkdir -p /data/lightasr/incoming
+RUN mkdir -p /data/lightasr/incoming /data/lightasr/recordings
+
+VOLUME ["/data/lightasr"]
 
 EXPOSE 8080
 

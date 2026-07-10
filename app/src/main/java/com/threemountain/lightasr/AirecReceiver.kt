@@ -118,11 +118,12 @@ object AirecNetwork {
             if (!networkInterface.isUp || networkInterface.isLoopback) continue
             val addresses = networkInterface.inetAddresses.toList()
             for (address in addresses) {
+                val hostAddress = address.hostAddress ?: continue
                 if (address is Inet4Address &&
                     !address.isLoopbackAddress &&
-                    !address.hostAddress.startsWith("169.254.")
+                    !hostAddress.startsWith("169.254.")
                 ) {
-                    return address.hostAddress
+                    return hostAddress
                 }
             }
         }
@@ -358,7 +359,7 @@ private class AirecUploadServer(
                 }
             } catch (e: AirecHttpError) {
                 Log.w(AIREC_TAG, "validation failed: ${e.message}")
-                sendResponse(output, e.statusCode, e.message ?: "error")
+                sendResponse(output, e.statusCode, e.message)
             } catch (t: Throwable) {
                 Log.e(AIREC_TAG, "save failed: ${t.message}", t)
                 sendResponse(output, 500, "save failed")

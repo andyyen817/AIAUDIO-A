@@ -19,12 +19,15 @@ recording intake. It is focused on offline WAV transcription on Android devices.
 - Absolute timestamp TXT output.
 - AIREC-style file names such as `20260522120423.wav` are parsed as recording
   start time `2026-05-22 12:04:23.000`.
+- Persistent transcription task history, checkpoint files, manual resume, and
+  foreground notifications for long local jobs.
+- Manual upload of completed WAV + TXT results to the LightASR server endpoint.
 - Voiceprint MVP UI and local employee/sample management are present for testing.
 
 ## Not Yet Complete
 
 - MP3/M4A/AAC decoding is not implemented; the current import path is WAV-first.
-- Cloud/server upload is not implemented in this Android project.
+- Automatic cloud-side ASR and business analysis are not implemented in V1.
 - Production-grade speaker diarization for 10-hour recordings is not complete.
 - Voiceprint identification is still experimental and must be validated with a
   real Android-side speaker embedding runtime before production use.
@@ -76,14 +79,17 @@ The debug package uses the `.vadtest` application id suffix.
 ## Zeabur Deployment
 
 This repository also contains a minimal server entrypoint for Zeabur. It is
-separate from the Android APK. Zeabur should build the root `Dockerfile`, which
-runs a FastAPI upload receiver on port `8080`.
+separate from the Android APK. Zeabur should build the repository root
+`Dockerfile`, which runs a FastAPI upload receiver on port `8080`.
 
 Endpoints:
 
 ```text
 GET  /health
+GET  /ready
 POST /api/airec/upload
+POST /api/v1/recordings
+GET  /api/v1/recordings/{recording_id}
 ```
 
 `POST /api/airec/upload` accepts AIREC-style multipart form data:
@@ -111,8 +117,13 @@ Recommended Zeabur environment variables:
 ```text
 PORT=8080
 INCOMING_DIR=/data/lightasr/incoming
-DATABASE_URL=<Zeabur PostgreSQL connection string>
+RECORDINGS_DIR=/data/lightasr/recordings
+DATABASE_URL=<rotated Zeabur PostgreSQL connection string>
+DATABASE_REQUIRED=true
+UPLOAD_TOKEN=<long random token>
 ALLOW_ALL_SN=true
+MAX_AUDIO_BYTES=2147483648
+MAX_TRANSCRIPT_BYTES=10485760
 ```
 
 For production, set `ALLOW_ALL_SN=false` and configure:
@@ -139,6 +150,11 @@ curl.exe -X POST http://127.0.0.1:8080/api/airec/upload `
 
 The server returns HTTP 200 with `ok` when the upload is saved or when the same
 `sn + fileName` has already been uploaded.
+
+`POST /api/v1/recordings` is used by the Android app after local recognition.
+It uploads the original WAV plus the generated UTF-8 TXT transcript. If
+`UPLOAD_TOKEN` is configured on the server, the Android app must send the same
+token as a Bearer token.
 
 ## Notes
 

@@ -3,6 +3,21 @@ plugins {
     alias(libs.plugins.jetbrains.kotlin.android)
 }
 
+val releaseStorePath = providers.gradleProperty("LIGHTASR_KEYSTORE_FILE").orNull
+    ?: System.getenv("LIGHTASR_KEYSTORE_FILE")
+val releaseStorePassword = providers.gradleProperty("LIGHTASR_KEYSTORE_PASSWORD").orNull
+    ?: System.getenv("LIGHTASR_KEYSTORE_PASSWORD")
+val releaseKeyAlias = providers.gradleProperty("LIGHTASR_KEY_ALIAS").orNull
+    ?: System.getenv("LIGHTASR_KEY_ALIAS")
+val releaseKeyPassword = providers.gradleProperty("LIGHTASR_KEY_PASSWORD").orNull
+    ?: System.getenv("LIGHTASR_KEY_PASSWORD")
+val releaseSigningConfigured = listOf(
+    releaseStorePath,
+    releaseStorePassword,
+    releaseKeyAlias,
+    releaseKeyPassword,
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.threemountain.lightasr"
     compileSdk = 34
@@ -11,11 +26,22 @@ android {
         applicationId = "com.threemountain.lightasr"
         minSdk = 23
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
 
         ndk {
             abiFilters += listOf("arm64-v8a", "x86_64")
+        }
+    }
+
+    signingConfigs {
+        if (releaseSigningConfigured) {
+            create("release") {
+                storeFile = file(releaseStorePath!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
 
@@ -24,7 +50,9 @@ android {
             applicationIdSuffix = ".vadtest"
         }
         release {
+            isDebuggable = false
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"

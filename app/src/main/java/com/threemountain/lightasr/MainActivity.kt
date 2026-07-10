@@ -13,6 +13,8 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.OpenableColumns
+import android.provider.Settings
+import android.text.InputType
 import android.text.method.ScrollingMovementMethod
 import android.util.Log
 import android.view.Gravity
@@ -38,6 +40,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -259,6 +262,11 @@ class MainActivity : ComponentActivity() {
     private lateinit var airecUploadRecordsView: TextView
     private lateinit var airecUploadRecordActions: LinearLayout
     private lateinit var sharedImportRecordsView: TextView
+    private lateinit var jobHistoryView: TextView
+    private lateinit var jobHistoryActions: LinearLayout
+    private lateinit var serverUrlInput: EditText
+    private lateinit var serverTokenInput: EditText
+    private lateinit var saveServerConfigButton: Button
     private lateinit var employeeNameInput: EditText
     private lateinit var employeeStoreInput: EditText
     private lateinit var voiceprintEmployeeView: TextView
@@ -280,20 +288,29 @@ class MainActivity : ComponentActivity() {
     private var lastOutput: String = ""
     private var selectedAudioFile: SelectedAudioFile? = null
     private var selectedVoiceprintEmployeeId: Long? = null
+    private var activeTranscriptionJobId: String? = null
     private val sharedAudioRecords = mutableListOf<SharedAudioRecord>()
     private var airecReceiverRegistered = false
     private val airecReceiverUpdates = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            activeTranscriptionJobId = TranscriptionForegroundService.activeJobId
             refreshAirecReceiverUi()
+            refreshJobHistoryUi()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         voiceprintManager = VoiceprintManager.create(this, assets)
+        if (!TranscriptionForegroundService.isRunning) {
+            TranscriptionJobRepository.markInterruptedJobs(this)
+        }
+        activeTranscriptionJobId = TranscriptionForegroundService.activeJobId
         buildUi()
         refreshAirecReceiverUi()
         refreshSharedImportRecordsUi()
+        refreshJobHistoryUi()
+        loadServerConfigUi()
         updateVoiceprintEmployeeView()
         initRecognizerAsync()
         handleShareIntent(intent)
@@ -315,13 +332,13 @@ class MainActivity : ComponentActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "LightASR 声纹测试版"
+            text = "LightASR"
             textSize = 22f
             gravity = Gravity.CENTER
         }
 
         val hint = TextView(this).apply {
-            text = "本地 ASR + 3D-Speaker 声纹测试版，不上传服务器。"
+            text = "本地离线长录音转写，完成后可选择上传原音频和 TXT。"
             textSize = 14f
             setPadding(0, dp(8), 0, dp(12))
         }
@@ -395,6 +412,33 @@ class MainActivity : ComponentActivity() {
             val padding = dp(12)
             setPadding(padding, padding, padding, padding)
             setBackgroundColor(0xFFEFF3F8.toInt())
+        }
+
+        jobHistoryView = TextView(this).apply {
+            textSize = 14f
+            val padding = dp(12)
+            setPadding(padding, padding, padding, padding)
+            setBackgroundColor(0xFFF3F6F4.toInt())
+        }
+        jobHistoryActions = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        val serverConfig = LightAsrServerConfigRepository.load(this)
+        serverUrlInput = EditText(this).apply {
+            setHint("服务器地址")
+            setSingleLine(true)
+            setText(serverConfig.baseUrl)
+        }
+        serverTokenInput = EditText(this).apply {
+            setHint("上传 Token（由管理员提供）")
+            setSingleLine(true)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(serverConfig.uploadToken)
+        }
+        saveServerConfigButton = Button(this).apply {
+            text = "保存服务器设置"
+            setOnClickListener { saveServerConfig() }
         }
 
         val voiceprintMarker = TextView(this).apply {
@@ -496,6 +540,27 @@ class MainActivity : ComponentActivity() {
         )
         root.addView(
             buildSection(
+                "任务记录",
+                "长录音会持续保存进度；中断后可继续，完成后可上传",
+                0xFFF3F6F4.toInt(),
+                jobHistoryView,
+                jobHistoryActions,
+            ),
+            sectionWrap(),
+        )
+        root.addView(
+            buildSection(
+                "服务器上传",
+                "仅在本地分析完成后，由用户手动上传 WAV 和 TXT",
+                0xFFEFF3F8.toInt(),
+                serverUrlInput,
+                serverTokenInput,
+                saveServerConfigButton,
+            ),
+            sectionWrap(),
+        )
+        root.addView(
+            buildSection(
                 "Android 分享导入",
                 "从其他录音 App 分享历史 WAV",
                 0xFFF3F6F4.toInt(),
@@ -519,8 +584,8 @@ class MainActivity : ComponentActivity() {
         )
         root.addView(
             buildSection(
-                "声纹识别 / 员工注册",
-                "员工样本、注册和所选音频说话人识别",
+                "员工声纹实验功能",
+                "不进入第一版正式转写结果，仅用于短音频验证",
                 0xFFFFF6E6.toInt(),
                 voiceprintMarker,
                 employeeNameInput,
@@ -849,7 +914,7 @@ AIREC 接收模式：$stateText
         }
 
         if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
-            sharedStreamUriList(intent)?.forEach { add(it) }
+            sharedStreamUriList(intent).forEach { add(it) }
         } else {
             add(sharedStreamUri(intent))
         }
@@ -1101,6 +1166,9 @@ AIREC 接收模式：$stateText
     }
 
     private fun onAudioFileSelected(uri: Uri) {
+        runCatching {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
         val info = queryAudioFileInfo(uri)
         selectedAudioFile = info
         selectedAudioView.text = buildSelectedAudioText(info)
@@ -1285,84 +1353,365 @@ Uri: ${file.uri}
         }
     }
 
-    private fun transcribeSelectedAudio() {
-        val currentRecognizer = recognizer ?: run {
-            setStatus("模型尚未就绪")
+    private fun transcribeSelectedAudio(resumeJobId: String? = null) {
+        val currentRecognizer = recognizer ?: run { setStatus("模型尚未就绪"); return }
+        if (activeTranscriptionJobId != null) {
+            setStatus("已有录音任务正在运行，请等待完成或在通知栏取消。")
             return
         }
-
-        val currentSelection = selectedAudioFile ?: run {
-            setStatus("请先选择 WAV 文件")
-            return
-        }
-
-        if (!isSupportedWav(currentSelection)) {
+        val selection = selectedAudioFile ?: run { setStatus("请先选择 WAV 文件"); return }
+        if (!isSupportedWav(selection)) {
             setStatus("当前第一版只支持 WAV 文件，请选择 .wav 音频。")
             return
         }
-
+        val displayName = selection.displayName ?: "selected_audio.wav"
+        val job = if (resumeJobId != null) {
+            TranscriptionJobRepository.get(this, resumeJobId) ?: run {
+                setStatus("找不到需要继续的任务"); return
+            }
+        } else {
+            TranscriptionJobRepository.create(
+                this, displayName, sourceTypeForSelection(selection), selection.uri.toString()
+            )
+        }
+        activeTranscriptionJobId = job.id
+        requestNotificationPermissionIfNeeded()
         progressBar.visibility = View.VISIBLE
         transcribeButton.isEnabled = false
         transcribeSelectedButton.isEnabled = false
         copyButton.isEnabled = false
         resultView.text = ""
-        setStatus("正在识别所选音频...")
+        setStatus(if (resumeJobId == null) "正在准备录音任务..." else "正在从检查点继续任务...")
+        refreshJobHistoryUi()
+        TranscriptionForegroundService.start(this, job.id, "LightASR 正在分析", displayName)
 
-        thread(name = "transcribe-selected-wav") {
+        thread(name = "transcription-job-" + job.id.take(8)) {
             try {
-                val wavFile = copySelectedUriToCache(
-                    currentSelection.uri,
-                    currentSelection.displayName,
-                )
-                val displayName = currentSelection.displayName ?: "所选音频"
-                val output = recognizeWavFile(
-                    currentRecognizer = currentRecognizer,
-                    wavFile = wavFile,
-                    sourceFileName = displayName,
-                )
-                val txtContent = buildTimestampedTxt(
-                    sourceFileName = displayName,
-                    output = output,
-                )
-                var txtFile: File? = null
-                var txtSaveError: String? = null
-                try {
-                    txtFile = saveTimestampedTxt(currentSelection.displayName, txtContent)
-                } catch (t: Throwable) {
-                    txtSaveError = t.message ?: t::class.java.simpleName
+                val wavFile = prepareJobAudio(job, selection)
+                TranscriptionJobRepository.update(this, job.id) {
+                    it.copy(status = TranscriptionJobStatus.TRANSCRIBING, errorMessage = null)
                 }
-                lastOutput = buildSelectedOutput(displayName, output, txtFile, txtSaveError)
-
-                runOnUiThread {
-                    progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = true
-                    updateSelectedAudioButtonState()
-                    copyButton.isEnabled = lastOutput.isNotBlank()
-                    resultView.text = lastOutput
-                    setStatus(
-                        if (!output.stats.hasAnySpeech) {
-                            NO_SPEECH_MESSAGE
-                        } else if (txtSaveError == null) {
-                            "识别完成：$displayName"
-                        } else {
-                            "TXT 保存失败：$txtSaveError"
-                        }
+                val output = recognizeWavFile(currentRecognizer, wavFile, displayName, job.id)
+                val txtFile = saveTimestampedTxt(displayName, buildTimestampedTxt(displayName, output))
+                lastOutput = buildSelectedOutput(displayName, output, txtFile, null)
+                TranscriptionJobRepository.update(this, job.id) {
+                    it.copy(
+                        transcriptPath = txtFile.absolutePath,
+                        durationMs = (output.durationSec * 1000.0).roundToLong(),
+                        nextChunkIndex = output.stats.totalChunks,
+                        progressPercent = 100,
+                        status = TranscriptionJobStatus.LOCAL_COMPLETED,
+                        errorMessage = null,
                     )
                 }
-            } catch (t: Throwable) {
-                val message = t.message ?: t::class.java.simpleName
-                lastOutput = "识别失败：\n$message"
-
                 runOnUiThread {
                     progressBar.visibility = View.GONE
                     transcribeButton.isEnabled = true
                     updateSelectedAudioButtonState()
-                    copyButton.isEnabled = false
+                    copyButton.isEnabled = true
                     resultView.text = lastOutput
-                    setStatus("识别失败：$message")
+                    setStatus(if (!output.stats.hasAnySpeech) NO_SPEECH_MESSAGE else "本地分析完成：" + displayName)
+                    refreshJobHistoryUi()
+                }
+            } catch (t: Throwable) {
+                val canceled = t is TranscriptionCanceledException
+                val message = t.message ?: t::class.java.simpleName
+                TranscriptionJobRepository.update(this, job.id) {
+                    it.copy(
+                        status = if (canceled) TranscriptionJobStatus.CANCELED else TranscriptionJobStatus.FAILED,
+                        errorMessage = message,
+                    )
+                }
+                lastOutput = if (canceled) "任务已取消" else "识别失败：\n" + message
+                runOnUiThread {
+                    progressBar.visibility = View.GONE
+                    transcribeButton.isEnabled = true
+                    updateSelectedAudioButtonState()
+                    resultView.text = lastOutput
+                    setStatus(lastOutput)
+                    refreshJobHistoryUi()
+                }
+            } finally {
+                activeTranscriptionJobId = null
+                TranscriptionForegroundService.stop(this, job.id)
+                if (isDestroyed) {
+                    runCatching { currentRecognizer.release() }
+                    runCatching { speechGate?.release() }
                 }
             }
         }
+    }
+
+    private fun prepareJobAudio(job: TranscriptionJob, selection: SelectedAudioFile): File {
+        job.audioPath?.let { path ->
+            val file = File(path)
+            if (file.isFile && file.length() > 44L) {
+                val hash = job.audioSha256 ?: sha256(file)
+                TranscriptionJobRepository.update(this, job.id) {
+                    it.copy(audioPath = file.absolutePath, audioSha256 = hash)
+                }
+                return file
+            }
+        }
+        val direct = if (selection.uri.scheme.equals("file", true)) selection.uri.path?.let(::File) else null
+        val appRoot = getExternalFilesDir(null)?.canonicalFile
+        if (direct != null && direct.isFile && direct.length() > 44L && appRoot != null &&
+            direct.canonicalFile.toPath().startsWith(appRoot.toPath())
+        ) {
+            val hash = sha256(direct)
+            TranscriptionJobRepository.update(this, job.id) {
+                it.copy(audioPath = direct.absolutePath, audioSha256 = hash)
+            }
+            return direct
+        }
+
+        val root = File(getExternalFilesDir(null) ?: filesDir, "Recordings/" + job.id)
+        check(root.exists() || root.mkdirs()) { "无法创建任务录音目录" }
+        val safeName = buildSafeSharedAudioFileName(selection.displayName).ifBlank { "selected_audio.wav" }
+        val target = File(root, safeName)
+        val part = File(root, safeName + ".part")
+        part.delete()
+        val expected = selection.sizeBytes ?: 0L
+        if (expected > 0L && root.usableSpace < expected + 64L * 1024L * 1024L) {
+            error("手机剩余空间不足，无法保存待分析录音。")
+        }
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        val input = contentResolver.openInputStream(selection.uri)
+            ?: error("无法读取所选音频：" + selection.uri)
+        input.use { source ->
+            FileOutputStream(part).use { output ->
+                val buffer = ByteArray(64 * 1024)
+                while (true) {
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                    digest.update(buffer, 0, count)
+                }
+                output.flush()
+                output.fd.sync()
+            }
+        }
+        check(part.length() > 44L) { "复制后的 WAV 文件为空" }
+        if (target.exists()) target.delete()
+        if (!part.renameTo(target)) {
+            part.copyTo(target, overwrite = true)
+            part.delete()
+        }
+        val hash = digest.digest().joinToString("") { "%02x".format(it) }
+        TranscriptionJobRepository.update(this, job.id) {
+            it.copy(audioPath = target.absolutePath, audioSha256 = hash)
+        }
+        return target
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    private fun sourceTypeForSelection(selection: SelectedAudioFile): String {
+        val path = selection.uri.path.orEmpty().replace('\\', '/')
+        return when {
+            path.contains("/Incoming/shared/", true) -> "shared"
+            path.contains("/Incoming/", true) -> "airec"
+            else -> "local"
+        }
+    }
+
+    private fun loadServerConfigUi() {
+        if (!::serverUrlInput.isInitialized) return
+        val config = LightAsrServerConfigRepository.load(this)
+        serverUrlInput.setText(config.baseUrl)
+        serverTokenInput.setText(config.uploadToken)
+    }
+
+    private fun saveServerConfig() {
+        try {
+            LightAsrServerConfigRepository.save(
+                this, serverUrlInput.text?.toString().orEmpty(), serverTokenInput.text?.toString().orEmpty()
+            )
+            setStatus("服务器设置已保存")
+        } catch (t: Throwable) {
+            setStatus("服务器设置保存失败：" + (t.message ?: t::class.java.simpleName))
+        }
+    }
+
+    private fun refreshJobHistoryUi() {
+        if (!::jobHistoryView.isInitialized) return
+        val jobs = TranscriptionJobRepository.list(this)
+        jobHistoryView.text = if (jobs.isEmpty()) "暂无分析任务" else buildString {
+            jobs.take(8).forEachIndexed { index, job ->
+                if (index > 0) appendLine()
+                appendLine((index + 1).toString() + ". " + job.sourceName)
+                appendLine("状态：" + jobStatusText(job.status) + "  进度：" + job.progressPercent + "%")
+                if (job.totalChunks > 0) appendLine("chunk：" + job.nextChunkIndex + "/" + job.totalChunks)
+                job.serverRecordingId?.let { appendLine("服务器记录：" + it) }
+                job.errorMessage?.let { appendLine("提示：" + it) }
+            }
+        }.trim()
+        refreshJobHistoryActions(jobs)
+    }
+
+    private fun refreshJobHistoryActions(jobs: List<TranscriptionJob>) {
+        if (!::jobHistoryActions.isInitialized) return
+        jobHistoryActions.removeAllViews()
+        jobs.take(5).forEachIndexed { index, job ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            row.addView(Button(this).apply {
+                text = "查看 " + (index + 1)
+                setOnClickListener { showJob(job.id) }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            if (job.status in setOf(
+                    TranscriptionJobStatus.INTERRUPTED,
+                    TranscriptionJobStatus.FAILED,
+                    TranscriptionJobStatus.CANCELED,
+                ) && job.audioPath?.let { File(it).isFile } == true
+            ) {
+                row.addView(Button(this).apply {
+                    text = "继续 " + (index + 1)
+                    isEnabled = recognizer != null && activeTranscriptionJobId == null
+                    setOnClickListener { resumeJob(job.id) }
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            if (job.status in setOf(
+                    TranscriptionJobStatus.LOCAL_COMPLETED,
+                    TranscriptionJobStatus.UPLOAD_FAILED,
+                )
+            ) {
+                row.addView(Button(this).apply {
+                    text = "上传 " + (index + 1)
+                    isEnabled = activeTranscriptionJobId == null
+                    setOnClickListener { uploadJob(job.id) }
+                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            jobHistoryActions.addView(row, matchWrap())
+        }
+    }
+
+    private fun showJob(jobId: String) {
+        val job = TranscriptionJobRepository.get(this, jobId) ?: return
+        val transcript = job.transcriptPath?.let(::File)?.takeIf { it.isFile }
+            ?.readText(Charsets.UTF_8)?.take(200_000)
+        lastOutput = transcript ?: buildString {
+            appendLine("任务：" + job.sourceName)
+            appendLine("状态：" + jobStatusText(job.status))
+            appendLine("进度：" + job.progressPercent + "%")
+            appendLine("已处理 chunk：" + job.nextChunkIndex + "/" + job.totalChunks)
+            job.errorMessage?.let { appendLine("提示：" + it) }
+        }.trim()
+        resultView.text = lastOutput
+        copyButton.isEnabled = lastOutput.isNotBlank()
+        setStatus("正在查看任务：" + job.sourceName)
+    }
+
+    private fun resumeJob(jobId: String) {
+        val job = TranscriptionJobRepository.get(this, jobId) ?: return
+        val audio = job.audioPath?.let(::File)
+        if (audio == null || !audio.isFile) {
+            setStatus("任务原音频不存在，无法继续")
+            return
+        }
+        selectedAudioFile = SelectedAudioFile(Uri.fromFile(audio), job.sourceName, "audio/wav", audio.length())
+        selectedAudioView.text = buildSelectedAudioText(selectedAudioFile!!)
+        updateSelectedAudioButtonState()
+        transcribeSelectedAudio(job.id)
+    }
+
+    private fun uploadJob(jobId: String) {
+        if (activeTranscriptionJobId != null) { setStatus("已有任务正在运行"); return }
+        val job = TranscriptionJobRepository.get(this, jobId) ?: return
+        val audio = job.audioPath?.let(::File)
+        val transcript = job.transcriptPath?.let(::File)
+        val hash = job.audioSha256
+        if (audio == null || !audio.isFile || transcript == null || !transcript.isFile || hash.isNullOrBlank()) {
+            setStatus("上传所需的 WAV、TXT 或 SHA256 不完整")
+            return
+        }
+        activeTranscriptionJobId = job.id
+        TranscriptionJobRepository.update(this, job.id) {
+            it.copy(status = TranscriptionJobStatus.UPLOADING, progressPercent = 0, errorMessage = null)
+        }
+        TranscriptionForegroundService.start(this, job.id, "LightASR 正在上传", job.sourceName)
+        refreshJobHistoryUi()
+        setStatus("正在上传 WAV 和 TXT...")
+
+        thread(name = "upload-job-" + job.id.take(8)) {
+            var lastProgress = -1
+            try {
+                val response = RecordingUploadClient(LightAsrServerConfigRepository.load(this)).upload(
+                    audio, transcript, job.sourceName, job.sourceType,
+                    recordingTimeIsoForSource(job.sourceName), job.durationMs, hash,
+                    packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown", deviceIdForUpload(),
+                ) { progress ->
+                    if (progress >= lastProgress + 2) {
+                        lastProgress = progress
+                        TranscriptionJobRepository.update(this, job.id) { it.copy(progressPercent = progress) }
+                        TranscriptionForegroundService.progress(
+                            this, job.id, "LightASR 正在上传", job.sourceName + "  " + progress + "%", progress
+                        )
+                    }
+                }
+                TranscriptionJobRepository.update(this, job.id) {
+                    it.copy(
+                        status = TranscriptionJobStatus.UPLOADED,
+                        progressPercent = 100,
+                        serverRecordingId = response.recordingId,
+                        errorMessage = null,
+                    )
+                }
+                runOnUiThread {
+                    setStatus("上传完成：" + response.recordingId)
+                    refreshJobHistoryUi()
+                    showJob(job.id)
+                }
+            } catch (t: Throwable) {
+                val message = t.message ?: t::class.java.simpleName
+                TranscriptionJobRepository.update(this, job.id) {
+                    it.copy(status = TranscriptionJobStatus.UPLOAD_FAILED, errorMessage = message)
+                }
+                runOnUiThread {
+                    setStatus("上传失败，可在任务记录中重试：" + message)
+                    refreshJobHistoryUi()
+                }
+            } finally {
+                activeTranscriptionJobId = null
+                TranscriptionForegroundService.stop(this, job.id)
+            }
+        }
+    }
+
+    private fun recordingTimeIsoForSource(sourceFileName: String): String? {
+        val epochMs = parseRecordingStartEpochMsFromAirecFileName(sourceFileName) ?: return null
+        return SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ssXXX", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone(DEFAULT_RECORDING_TIMEZONE_ID)
+        }.format(Date(epochMs))
+    }
+
+    private fun deviceIdForUpload(): String {
+        val id = Settings.Secure.getString(contentResolver, Settings.Secure.ANDROID_ID)
+            ?.replace(Regex("[^A-Za-z0-9_.-]"), "_").orEmpty().ifBlank { "unknown" }
+        return "android-" + id
+    }
+
+    private fun jobStatusText(status: TranscriptionJobStatus): String = when (status) {
+        TranscriptionJobStatus.PREPARING -> "准备中"
+        TranscriptionJobStatus.TRANSCRIBING -> "分析中"
+        TranscriptionJobStatus.INTERRUPTED -> "已中断，可继续"
+        TranscriptionJobStatus.LOCAL_COMPLETED -> "本地分析完成"
+        TranscriptionJobStatus.FAILED -> "分析失败"
+        TranscriptionJobStatus.CANCELED -> "已取消"
+        TranscriptionJobStatus.UPLOADING -> "上传中"
+        TranscriptionJobStatus.UPLOADED -> "已上传"
+        TranscriptionJobStatus.UPLOAD_FAILED -> "上传失败，可重试"
     }
 
     private fun createVoiceprintEmployee() {
@@ -1682,6 +2031,7 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
         currentRecognizer: OfflineRecognizer,
         wavFile: File,
         sourceFileName: String? = wavFile.name,
+        jobId: String? = null,
     ): RecognitionOutput {
         val currentSpeechGate = speechGate ?: error("人声检测模型尚未就绪，不能直接执行 ASR")
         val header = parseWavHeader(wavFile)
@@ -1711,12 +2061,26 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             segmentationMode = "chunked-${CHUNKED_SEGMENT_MS / 1000}s-speechgate-full-chunk-asr-overlap-${formatSeconds(CHUNKED_OVERLAP_MS)}s"
             buildChunkedSegmentRanges(header.durationMs)
         }
+        if (jobId != null) {
+            val checkpoint = TranscriptionCheckpointStore.load(this, jobId)
+            TranscriptionJobRepository.update(this, jobId) {
+                it.copy(
+                    durationMs = header.durationMs,
+                    totalChunks = ranges.size,
+                    nextChunkIndex = checkpoint?.nextRangeIndex ?: 0,
+                    progressPercent = if (ranges.isEmpty()) 0 else
+                        ((checkpoint?.nextRangeIndex ?: 0) * 100 / ranges.size).coerceIn(0, 99),
+                    status = TranscriptionJobStatus.TRANSCRIBING,
+                )
+            }
+        }
         val chunkResult = recognizeChunkedWav(
             currentRecognizer = currentRecognizer,
             currentSpeechGate = currentSpeechGate,
             wavFile = wavFile,
             header = header,
             ranges = ranges,
+            jobId = jobId,
         )
         val rawSegments = chunkResult.segments
         val segments = dedupRecognitionSegments(rawSegments)
@@ -2107,18 +2471,28 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
         wavFile: File,
         header: WavHeader,
         ranges: List<SegmentRange>,
+        jobId: String? = null,
     ): ChunkRecognitionResult {
-        val segments = mutableListOf<RecognitionSegment>()
-        var speechDurationMs = 0L
-        var skippedNoSpeechDurationMs = 0L
-        var speechChunks = 0
-        var skippedChunks = 0
-        var asrProcessedDurationMs = 0L
+        val checkpoint = jobId?.let { TranscriptionCheckpointStore.load(this, it) }
+        val segments = checkpoint?.segments?.toMutableList() ?: mutableListOf()
+        var speechDurationMs = checkpoint?.speechDurationMs ?: 0L
+        var skippedNoSpeechDurationMs = checkpoint?.skippedNoSpeechDurationMs ?: 0L
+        var speechChunks = checkpoint?.speechChunks ?: 0
+        var skippedChunks = checkpoint?.skippedChunks ?: 0
+        var asrProcessedDurationMs = checkpoint?.asrProcessedDurationMs ?: 0L
+        val resumeAt = (checkpoint?.nextRangeIndex ?: 0).coerceIn(0, ranges.size)
+
+        Log.i(TAG, "chunk recognition resumeAt=" + resumeAt + " total=" + ranges.size +
+            " restoredSegments=" + segments.size)
 
         RandomAccessFile(wavFile, "r").use { input ->
             var reusableBytes = ByteArray(0)
-
             for ((position, range) in ranges.withIndex()) {
+                if (position < resumeAt) continue
+                if (TranscriptionForegroundService.isCancellationRequested(jobId)) {
+                    throw TranscriptionCanceledException()
+                }
+
                 val (nextReusableBytes, chunkAudio) = readPcmChunkAsMonoFloat(
                     input = input,
                     header = header,
@@ -2128,7 +2502,12 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                 reusableBytes = nextReusableBytes
 
                 if (chunkAudio.samples.isEmpty()) {
-                    Log.w(TAG, "skip empty chunk index=${position + 1}, startMs=${range.startMs}, endMs=${range.endMs}")
+                    Log.w(TAG, "skip empty chunk index=" + (position + 1))
+                    persistJobCheckpoint(
+                        jobId, position, ranges.size, header.durationMs, range.endMs,
+                        speechDurationMs, skippedNoSpeechDurationMs, speechChunks,
+                        skippedChunks, asrProcessedDurationMs, null,
+                    )
                     continue
                 }
 
@@ -2142,17 +2521,16 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                 if (!vadResult.hasSpeech) {
                     skippedChunks += 1
                     skippedNoSpeechDurationMs += chunkDurationMs
-                    Log.i(
-                        TAG,
-                        "skip no-speech chunk index=${range.index.takeIf { it > 0 } ?: position + 1}, " +
-                            "startMs=${chunkAudio.startMs}, endMs=${chunkAudio.endMs}, " +
-                            "durationMs=$chunkDurationMs, speechRatio=${"%.4f".format(Locale.US, vadResult.speechRatio)}"
+                    Log.i(TAG, "skip no-speech chunk index=" + (position + 1) +
+                        " startMs=" + chunkAudio.startMs + " endMs=" + chunkAudio.endMs)
+                    persistJobCheckpoint(
+                        jobId, position, ranges.size, header.durationMs, chunkAudio.endMs,
+                        speechDurationMs, skippedNoSpeechDurationMs, speechChunks,
+                        skippedChunks, asrProcessedDurationMs, null,
                     )
-                    runOnUiThread {
-                        setStatus(
-                            "正在识别... 已跳过无人声 ${formatTxtTimestamp(chunkAudio.endMs)} / " +
-                                "${formatTxtTimestamp(header.durationMs)}"
-                        )
+                    if (!isDestroyed) runOnUiThread {
+                        setStatus("正在识别... 已跳过无人声 " + formatTxtTimestamp(chunkAudio.endMs) +
+                            " / " + formatTxtTimestamp(header.durationMs))
                     }
                     continue
                 }
@@ -2160,18 +2538,12 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                 speechChunks += 1
                 speechDurationMs += vadResult.totalSpeechMs
                 asrProcessedDurationMs += chunkDurationMs
-
-                Log.i(
-                    TAG,
-                    "recognize chunk index=${range.index.takeIf { it > 0 } ?: position + 1}, " +
-                        "startMs=${chunkAudio.startMs}, " +
-                        "endMs=${chunkAudio.endMs}, durationMs=$chunkDurationMs, " +
-                        "mode=${range.cutMode}, sampleCount=${chunkAudio.samples.size}, " +
-                        "vadSpeechMs=${vadResult.totalSpeechMs}, " +
-                        "vadSpeechRatio=${"%.4f".format(Locale.US, vadResult.speechRatio)}, " +
-                        "asrInput=full-speechgate-approved-chunk, " +
-                        "usedHeap=${currentUsedHeapBytes()}"
-                )
+                Log.i(TAG, "recognize chunk index=" + (position + 1) +
+                    " startMs=" + chunkAudio.startMs + " endMs=" + chunkAudio.endMs +
+                    " durationMs=" + chunkDurationMs + " mode=" + range.cutMode +
+                    " sampleCount=" + chunkAudio.samples.size +
+                    " vadSpeechMs=" + vadResult.totalSpeechMs +
+                    " usedHeap=" + currentUsedHeapBytes())
 
                 val segmentText = recognizeSamples(
                     currentRecognizer = currentRecognizer,
@@ -2179,30 +2551,31 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                     sampleRate = header.sampleRate,
                     chunkIndex = range.index.takeIf { it > 0 } ?: position + 1,
                     chunkDurationMs = chunkDurationMs,
-                    logNativeTimestampDetail = position == 0,
+                    logNativeTimestampDetail = position == resumeAt,
                 )
-                val segmentIndex = segments.size + 1
-                segments += RecognitionSegment(
-                    index = segmentIndex,
+                val segment = RecognitionSegment(
+                    index = segments.size + 1,
                     startMs = chunkAudio.startMs,
                     endMs = chunkAudio.endMs,
                     text = segmentText,
-                    cutMode = "${range.cutMode}+speechgate-full-chunk",
+                    cutMode = range.cutMode + "+speechgate-full-chunk",
                     startUs = chunkAudio.startUs,
                     endUs = chunkAudio.endUs,
                 )
-
-                Log.i(
-                    TAG,
-                    "transcript segment index=$segmentIndex, chunk=${range.index.takeIf { it > 0 } ?: position + 1}, " +
-                        "relativeStartUs=${chunkAudio.startUs}, relativeEndUs=${chunkAudio.endUs}, " +
-                        "timestampSource=${TimestampSource.ESTIMATED}, textLength=${segmentText.length}"
+                segments += segment
+                persistJobCheckpoint(
+                    jobId, position, ranges.size, header.durationMs, chunkAudio.endMs,
+                    speechDurationMs, skippedNoSpeechDurationMs, speechChunks,
+                    skippedChunks, asrProcessedDurationMs, segment,
                 )
-                runOnUiThread {
-                    setStatus(
-                        "正在识别... 已处理 ${formatTxtTimestamp(chunkAudio.endMs)} / " +
-                            "${formatTxtTimestamp(header.durationMs)}"
-                    )
+
+                Log.i(TAG, "transcript segment index=" + segment.index +
+                    " relativeStartUs=" + chunkAudio.startUs +
+                    " relativeEndUs=" + chunkAudio.endUs +
+                    " textLength=" + segmentText.length)
+                if (!isDestroyed) runOnUiThread {
+                    setStatus("正在识别... 已处理 " + formatTxtTimestamp(chunkAudio.endMs) +
+                        " / " + formatTxtTimestamp(header.durationMs))
                 }
             }
         }
@@ -2216,15 +2589,54 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             skippedChunks = skippedChunks,
             asrProcessedDurationMs = asrProcessedDurationMs,
         )
-        Log.i(
-            TAG,
-            "speech gate summary totalMs=${stats.totalDurationMs}, speechMs=${stats.speechDurationMs}, " +
-                "skippedNoSpeechMs=${stats.skippedNoSpeechDurationMs}, totalChunks=${stats.totalChunks}, " +
-                "speechChunks=${stats.speechChunks}, skippedChunks=${stats.skippedChunks}, " +
-                "asrProcessedMs=${stats.asrProcessedDurationMs}"
-        )
-
+        Log.i(TAG, "speech gate summary totalMs=" + stats.totalDurationMs +
+            " speechMs=" + stats.speechDurationMs +
+            " skippedNoSpeechMs=" + stats.skippedNoSpeechDurationMs +
+            " totalChunks=" + stats.totalChunks +
+            " speechChunks=" + stats.speechChunks +
+            " skippedChunks=" + stats.skippedChunks)
         return ChunkRecognitionResult(segments = segments, stats = stats)
+    }
+
+    private fun persistJobCheckpoint(
+        jobId: String?,
+        rangePosition: Int,
+        totalRanges: Int,
+        totalDurationMs: Long,
+        processedEndMs: Long,
+        speechDurationMs: Long,
+        skippedNoSpeechDurationMs: Long,
+        speechChunks: Int,
+        skippedChunks: Int,
+        asrProcessedDurationMs: Long,
+        segment: RecognitionSegment?,
+    ) {
+        if (jobId == null) return
+        val nextRange = rangePosition + 1
+        val progress = if (totalRanges <= 0) 0 else
+            ((nextRange.toLong() * 100L) / totalRanges.toLong()).toInt().coerceIn(0, 99)
+        TranscriptionCheckpointStore.saveAfterChunk(
+            this, jobId, rangePosition, nextRange,
+            speechDurationMs, skippedNoSpeechDurationMs, speechChunks,
+            skippedChunks, asrProcessedDurationMs, segment,
+        )
+        TranscriptionJobRepository.update(this, jobId) {
+            it.copy(
+                durationMs = totalDurationMs,
+                totalChunks = totalRanges,
+                nextChunkIndex = nextRange,
+                progressPercent = progress,
+                status = TranscriptionJobStatus.TRANSCRIBING,
+                errorMessage = null,
+            )
+        }
+        TranscriptionForegroundService.progress(
+            this,
+            jobId,
+            "LightASR 正在分析",
+            formatTxtTimestamp(processedEndMs) + " / " + formatTxtTimestamp(totalDurationMs),
+            progress,
+        )
     }
 
     private fun readPcmChunkAsMonoFloat(
@@ -3552,6 +3964,7 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
             val filter = IntentFilter().apply {
                 addAction(AirecReceiverService.ACTION_STATE_CHANGED)
                 addAction(AirecReceiverService.ACTION_UPLOAD_RECEIVED)
+                addAction(TranscriptionForegroundService.ACTION_JOB_UPDATED)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 registerReceiver(airecReceiverUpdates, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -3561,7 +3974,9 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
             }
             airecReceiverRegistered = true
         }
+        activeTranscriptionJobId = TranscriptionForegroundService.activeJobId
         refreshAirecReceiverUi()
+        refreshJobHistoryUi()
     }
 
     override fun onStop() {
@@ -3573,8 +3988,12 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
     }
 
     override fun onDestroy() {
-        recognizer?.release()
-        recognizer = null
+        if (activeTranscriptionJobId == null) {
+            recognizer?.release()
+            recognizer = null
+            speechGate?.release()
+            speechGate = null
+        }
         super.onDestroy()
     }
 }

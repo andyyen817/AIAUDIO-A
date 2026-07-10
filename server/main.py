@@ -1,14 +1,20 @@
+import hashlib
 import logging
 import os
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import psycopg
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+try:
+    import psycopg
+except ImportError:  # Local file-only tests do not require PostgreSQL.
+    psycopg = None
+
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 
 logging.basicConfig(
@@ -19,24 +25,48 @@ logger = logging.getLogger("lightasr.upload")
 
 FILE_NAME_RE = re.compile(r"^\d{14}\.wav$", re.IGNORECASE)
 SN_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 CHUNK_SIZE = 1024 * 1024
+DEFAULT_MAX_AUDIO_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
 
-app = FastAPI(title="LightASR AIREC Upload Receiver", version="0.1.0")
+app = FastAPI(title="LightASR Upload Receiver", version="0.2.0")
+database_status = "disabled"
+database_error: Optional[str] = None
 
 
 def incoming_root() -> Path:
     return Path(os.getenv("INCOMING_DIR", "/data/lightasr/incoming")).resolve()
 
 
+def analyzed_recordings_root() -> Path:
+    configured = os.getenv("RECORDINGS_DIR")
+    if configured:
+        return Path(configured).resolve()
+    return (incoming_root().parent / "recordings").resolve()
+
+
 def database_url() -> Optional[str]:
     return os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+
+
+def database_required() -> bool:
+    return os.getenv("DATABASE_REQUIRED", "false").lower() in {"1", "true", "yes"}
+
+
+def max_audio_bytes() -> int:
+    return int(os.getenv("MAX_AUDIO_BYTES", str(DEFAULT_MAX_AUDIO_BYTES)))
+
+
+def max_transcript_bytes() -> int:
+    return int(os.getenv("MAX_TRANSCRIPT_BYTES", str(DEFAULT_MAX_TRANSCRIPT_BYTES)))
 
 
 def is_allowed_sn(sn: str) -> bool:
     allow_all = os.getenv("ALLOW_ALL_SN", "true").lower() in {"1", "true", "yes"}
     if allow_all:
         return True
-
     allowed = {
         item.strip()
         for item in os.getenv("AUTHORIZED_SN", "").split(",")
@@ -45,20 +75,47 @@ def is_allowed_sn(sn: str) -> bool:
     return sn in allowed
 
 
+def validate_upload_token(authorization: Optional[str]) -> None:
+    configured_token = os.getenv("UPLOAD_TOKEN", "").strip()
+    if not configured_token:
+        logger.warning("UPLOAD_TOKEN is not configured; Android upload API is unauthenticated")
+        return
+    scheme, _, supplied_token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not secrets.compare_digest(supplied_token, configured_token):
+        raise HTTPException(status_code=403, detail="invalid upload token")
+
+
 def validate_upload_fields(file_name: Optional[str], sn: Optional[str]) -> tuple[str, str]:
     if not file_name:
         raise HTTPException(status_code=400, detail="fileName is required")
     if not sn:
         raise HTTPException(status_code=400, detail="sn is required")
-
     if not FILE_NAME_RE.fullmatch(file_name):
         raise HTTPException(status_code=400, detail="fileName must match yyyyMMddHHmmss.wav")
     if not SN_RE.fullmatch(sn):
         raise HTTPException(status_code=400, detail="sn contains invalid characters")
     if not is_allowed_sn(sn):
         raise HTTPException(status_code=403, detail="sn is not authorized")
-
     return file_name, sn
+
+
+def validate_recording_fields(
+    original_name: Optional[str],
+    device_id: Optional[str],
+    audio_sha256: Optional[str],
+    source: Optional[str],
+) -> tuple[str, str, str, str]:
+    name = Path(original_name or "").name
+    if not name or name != original_name or not name.lower().endswith(".wav"):
+        raise HTTPException(status_code=400, detail="original_name must be a safe .wav file name")
+    if not device_id or not DEVICE_ID_RE.fullmatch(device_id):
+        raise HTTPException(status_code=400, detail="device_id contains invalid characters")
+    if not audio_sha256 or not SHA256_RE.fullmatch(audio_sha256):
+        raise HTTPException(status_code=400, detail="audio_sha256 must contain 64 hex characters")
+    normalized_source = (source or "").lower()
+    if normalized_source not in {"local", "airec", "shared"}:
+        raise HTTPException(status_code=400, detail="source must be local, airec, or shared")
+    return name, device_id, audio_sha256.lower(), normalized_source
 
 
 def ensure_inside_root(root: Path, candidate: Path) -> None:
@@ -68,37 +125,76 @@ def ensure_inside_root(root: Path, candidate: Path) -> None:
         raise HTTPException(status_code=400, detail="invalid save path") from exc
 
 
+def require_database_driver() -> None:
+    if database_url() and psycopg is None:
+        raise RuntimeError("DATABASE_URL is configured but psycopg is not installed")
+
+
 def init_database() -> None:
+    global database_status, database_error
     url = database_url()
     if not url:
+        database_status = "disabled"
+        database_error = None
         logger.info("database disabled: DATABASE_URL is not configured")
         return
-
-    with psycopg.connect(url) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS airec_uploads (
-                    id BIGSERIAL PRIMARY KEY,
-                    sn TEXT NOT NULL,
-                    file_name TEXT NOT NULL,
-                    saved_path TEXT NOT NULL,
-                    size_bytes BIGINT NOT NULL,
-                    status TEXT NOT NULL,
-                    upload_time TIMESTAMPTZ NOT NULL DEFAULT now(),
-                    UNIQUE (sn, file_name)
+    try:
+        require_database_driver()
+        with psycopg.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS airec_uploads (
+                        id BIGSERIAL PRIMARY KEY,
+                        sn TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        saved_path TEXT NOT NULL,
+                        size_bytes BIGINT NOT NULL,
+                        status TEXT NOT NULL,
+                        upload_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (sn, file_name)
+                    )
+                    """
                 )
-                """
-            )
-        conn.commit()
-    logger.info("database ready")
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS lightasr_recordings (
+                        recording_id TEXT PRIMARY KEY,
+                        device_id TEXT NOT NULL,
+                        audio_sha256 TEXT NOT NULL,
+                        original_name TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        recording_time TIMESTAMPTZ,
+                        duration_ms BIGINT,
+                        app_version TEXT,
+                        audio_path TEXT NOT NULL,
+                        transcript_path TEXT NOT NULL,
+                        audio_size_bytes BIGINT NOT NULL,
+                        transcript_size_bytes BIGINT NOT NULL,
+                        upload_status TEXT NOT NULL,
+                        analysis_status TEXT NOT NULL DEFAULT 'not_requested',
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        UNIQUE (device_id, audio_sha256)
+                    )
+                    """
+                )
+            conn.commit()
+        database_status = "ready"
+        database_error = None
+        logger.info("database ready")
+    except Exception as exc:
+        database_status = "error"
+        database_error = str(exc)
+        logger.exception("database initialization failed: %s", exc)
+        if database_required():
+            raise
 
 
-def record_upload(sn: str, file_name: str, saved_path: Path, size_bytes: int) -> None:
+def record_airec_upload(sn: str, file_name: str, saved_path: Path, size_bytes: int) -> None:
     url = database_url()
-    if not url:
+    if not url or database_status != "ready":
         return
-
     try:
         with psycopg.connect(url) as conn:
             with conn.cursor() as cur:
@@ -106,29 +202,125 @@ def record_upload(sn: str, file_name: str, saved_path: Path, size_bytes: int) ->
                     """
                     INSERT INTO airec_uploads
                         (sn, file_name, saved_path, size_bytes, status, upload_time)
-                    VALUES
-                        (%s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     ON CONFLICT (sn, file_name) DO NOTHING
                     """,
-                    (
-                        sn,
-                        file_name,
-                        str(saved_path),
-                        size_bytes,
-                        "uploaded",
-                        datetime.now(timezone.utc),
-                    ),
+                    (sn, file_name, str(saved_path), size_bytes, "uploaded", datetime.now(timezone.utc)),
                 )
             conn.commit()
     except Exception as exc:
         logger.exception("database record failed: sn=%s fileName=%s error=%s", sn, file_name, exc)
 
 
+def upsert_recording(
+    *,
+    recording_id: str,
+    device_id: str,
+    audio_sha256: str,
+    original_name: str,
+    source: str,
+    recording_time: Optional[datetime],
+    duration_ms: Optional[int],
+    app_version: Optional[str],
+    audio_path: Path,
+    transcript_path: Path,
+) -> None:
+    url = database_url()
+    if not url:
+        if database_required():
+            raise RuntimeError("DATABASE_URL is required")
+        return
+    if database_status != "ready":
+        raise RuntimeError(f"database is not ready: {database_error or database_status}")
+    with psycopg.connect(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO lightasr_recordings (
+                    recording_id, device_id, audio_sha256, original_name, source,
+                    recording_time, duration_ms, app_version, audio_path, transcript_path,
+                    audio_size_bytes, transcript_size_bytes, upload_status, analysis_status,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, 'uploaded', 'not_requested', now(), now()
+                )
+                ON CONFLICT (device_id, audio_sha256) DO UPDATE SET
+                    audio_path = EXCLUDED.audio_path,
+                    transcript_path = EXCLUDED.transcript_path,
+                    audio_size_bytes = EXCLUDED.audio_size_bytes,
+                    transcript_size_bytes = EXCLUDED.transcript_size_bytes,
+                    upload_status = 'uploaded',
+                    updated_at = now()
+                """,
+                (
+                    recording_id, device_id, audio_sha256, original_name, source,
+                    recording_time, duration_ms, app_version, str(audio_path), str(transcript_path),
+                    audio_path.stat().st_size, transcript_path.stat().st_size,
+                ),
+            )
+        conn.commit()
+
+
+def recording_id_for(device_id: str, audio_sha256: str) -> str:
+    digest = hashlib.sha256(f"{device_id}:{audio_sha256}".encode("utf-8")).hexdigest()
+    return f"rec_{digest[:32]}"
+
+
+def parse_recording_time(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="recording_time must be ISO-8601") from exc
+    if parsed.tzinfo is None:
+        raise HTTPException(status_code=400, detail="recording_time must include timezone")
+    return parsed
+
+
+async def stream_upload_to_file(
+    upload: UploadFile,
+    target: Path,
+    limit_bytes: int,
+    hash_audio: bool = False,
+) -> tuple[int, Optional[str]]:
+    size_bytes = 0
+    digest = hashlib.sha256() if hash_audio else None
+    with target.open("wb") as output:
+        while True:
+            chunk = await upload.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            if size_bytes > limit_bytes:
+                raise HTTPException(status_code=413, detail="uploaded file is too large")
+            output.write(chunk)
+            if digest is not None:
+                digest.update(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    return size_bytes, digest.hexdigest() if digest is not None else None
+
+
+def validate_wav_file(path: Path) -> None:
+    with path.open("rb") as input_file:
+        header = input_file.read(12)
+    if len(header) < 12 or header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+        raise HTTPException(status_code=400, detail="file is not a RIFF/WAVE wav")
+    if path.stat().st_size <= 44:
+        raise HTTPException(status_code=400, detail="wav file is empty")
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     incoming_root().mkdir(parents=True, exist_ok=True)
+    analyzed_recordings_root().mkdir(parents=True, exist_ok=True)
     init_database()
-    logger.info("LightASR upload receiver started incomingDir=%s", incoming_root())
+    logger.info(
+        "LightASR upload receiver started incomingDir=%s recordingsDir=%s",
+        incoming_root(), analyzed_recordings_root(),
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -147,6 +339,17 @@ def health() -> str:
     return "ok\n"
 
 
+@app.get("/ready")
+def ready() -> JSONResponse:
+    ready_state = database_status != "error" and (
+        not database_required() or database_status == "ready"
+    )
+    return JSONResponse(
+        {"ready": ready_state, "database": database_status, "storage": str(analyzed_recordings_root())},
+        status_code=200 if ready_state else 503,
+    )
+
+
 @app.post("/api/airec/upload", response_class=PlainTextResponse)
 async def upload_airec(
     file: Optional[UploadFile] = File(default=None),
@@ -155,67 +358,145 @@ async def upload_airec(
 ) -> str:
     if file is None:
         raise HTTPException(status_code=400, detail="file is required")
-
     file_name, device_sn = validate_upload_fields(fileName, sn)
     logger.info("upload start: sn=%s fileName=%s", device_sn, file_name)
-
     root = incoming_root()
     device_dir = (root / device_sn).resolve()
     final_path = (device_dir / file_name).resolve()
     part_path = (device_dir / f"{file_name}.part").resolve()
     ensure_inside_root(root, final_path)
     ensure_inside_root(root, part_path)
-
     device_dir.mkdir(parents=True, exist_ok=True)
-
     if final_path.exists():
-        size_bytes = final_path.stat().st_size
-        logger.info(
-            "duplicate ignored: sn=%s fileName=%s sizeBytes=%s savedPath=%s",
-            device_sn,
-            file_name,
-            size_bytes,
-            final_path,
-        )
+        logger.info("duplicate ignored: sn=%s fileName=%s", device_sn, file_name)
         return "ok\n"
-
-    if part_path.exists():
-        part_path.unlink()
-
+    part_path.unlink(missing_ok=True)
     try:
-        header = await file.read(12)
-        if len(header) < 12 or header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
-            raise HTTPException(status_code=400, detail="file is not a RIFF/WAVE wav")
-
-        size_bytes = 0
-        with part_path.open("wb") as out:
-            out.write(header)
-            size_bytes += len(header)
-            while True:
-                chunk = await file.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                out.write(chunk)
-                size_bytes += len(chunk)
-
-        if size_bytes <= 44:
-            part_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=400, detail="wav file is empty")
-
+        size_bytes, _ = await stream_upload_to_file(file, part_path, max_audio_bytes())
+        validate_wav_file(part_path)
         part_path.replace(final_path)
-        record_upload(device_sn, file_name, final_path, size_bytes)
-
+        record_airec_upload(device_sn, file_name, final_path, size_bytes)
         logger.info(
             "upload success: sn=%s fileName=%s sizeBytes=%s savedPath=%s",
-            device_sn,
-            file_name,
-            size_bytes,
-            final_path,
+            device_sn, file_name, size_bytes, final_path,
         )
         return "ok\n"
     except HTTPException:
+        part_path.unlink(missing_ok=True)
         raise
     except Exception as exc:
         part_path.unlink(missing_ok=True)
         logger.exception("save failed: sn=%s fileName=%s error=%s", device_sn, file_name, exc)
         raise HTTPException(status_code=500, detail="file save failed") from exc
+
+
+@app.post("/api/v1/recordings")
+async def upload_analyzed_recording(
+    audio_file: Optional[UploadFile] = File(default=None),
+    transcript_file: Optional[UploadFile] = File(default=None),
+    original_name: Optional[str] = Form(default=None),
+    source: Optional[str] = Form(default=None),
+    recording_time: Optional[str] = Form(default=None),
+    duration_ms: Optional[int] = Form(default=None),
+    audio_sha256: Optional[str] = Form(default=None),
+    app_version: Optional[str] = Form(default=None),
+    device_id: Optional[str] = Form(default=None),
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, str]:
+    validate_upload_token(authorization)
+    if audio_file is None:
+        raise HTTPException(status_code=400, detail="audio_file is required")
+    if transcript_file is None:
+        raise HTTPException(status_code=400, detail="transcript_file is required")
+    safe_name, safe_device_id, expected_sha256, safe_source = validate_recording_fields(
+        original_name, device_id, audio_sha256, source,
+    )
+    parsed_recording_time = parse_recording_time(recording_time)
+    if duration_ms is not None and duration_ms < 0:
+        raise HTTPException(status_code=400, detail="duration_ms must be non-negative")
+
+    recording_id = recording_id_for(safe_device_id, expected_sha256)
+    root = analyzed_recordings_root()
+    target_dir = (root / safe_device_id / recording_id).resolve()
+    audio_path = (target_dir / safe_name).resolve()
+    transcript_path = (target_dir / f"{Path(safe_name).stem}.txt").resolve()
+    audio_part = Path(f"{audio_path}.part")
+    transcript_part = Path(f"{transcript_path}.part")
+    for path in (target_dir, audio_path, transcript_path, audio_part, transcript_part):
+        ensure_inside_root(root, path)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if audio_path.exists() and transcript_path.exists():
+        upsert_recording(
+            recording_id=recording_id, device_id=safe_device_id, audio_sha256=expected_sha256,
+            original_name=safe_name, source=safe_source, recording_time=parsed_recording_time,
+            duration_ms=duration_ms, app_version=app_version,
+            audio_path=audio_path, transcript_path=transcript_path,
+        )
+        logger.info("recording duplicate ignored recordingId=%s", recording_id)
+        return {"recording_id": recording_id, "upload_status": "uploaded"}
+
+    audio_part.unlink(missing_ok=True)
+    transcript_part.unlink(missing_ok=True)
+    try:
+        audio_size, actual_sha256 = await stream_upload_to_file(
+            audio_file, audio_part, max_audio_bytes(), hash_audio=True,
+        )
+        transcript_size, _ = await stream_upload_to_file(
+            transcript_file, transcript_part, max_transcript_bytes(),
+        )
+        validate_wav_file(audio_part)
+        if actual_sha256 != expected_sha256:
+            raise HTTPException(status_code=400, detail="audio_sha256 does not match uploaded audio")
+        if transcript_size <= 0:
+            raise HTTPException(status_code=400, detail="transcript_file is empty")
+        transcript_part.read_text(encoding="utf-8")
+        audio_part.replace(audio_path)
+        transcript_part.replace(transcript_path)
+        upsert_recording(
+            recording_id=recording_id, device_id=safe_device_id, audio_sha256=expected_sha256,
+            original_name=safe_name, source=safe_source, recording_time=parsed_recording_time,
+            duration_ms=duration_ms, app_version=app_version,
+            audio_path=audio_path, transcript_path=transcript_path,
+        )
+        logger.info(
+            "recording upload success recordingId=%s deviceId=%s audioBytes=%s transcriptBytes=%s",
+            recording_id, safe_device_id, audio_size, transcript_size,
+        )
+        return {"recording_id": recording_id, "upload_status": "uploaded"}
+    except HTTPException:
+        audio_part.unlink(missing_ok=True)
+        transcript_part.unlink(missing_ok=True)
+        raise
+    except UnicodeDecodeError as exc:
+        audio_part.unlink(missing_ok=True)
+        transcript_part.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="transcript_file must be UTF-8 text") from exc
+    except Exception as exc:
+        audio_part.unlink(missing_ok=True)
+        transcript_part.unlink(missing_ok=True)
+        logger.exception("recording upload failed recordingId=%s error=%s", recording_id, exc)
+        raise HTTPException(status_code=500, detail="recording upload failed") from exc
+
+
+@app.get("/api/v1/recordings/{recording_id}")
+def get_recording(recording_id: str, authorization: Optional[str] = Header(default=None)) -> dict:
+    validate_upload_token(authorization)
+    if not re.fullmatch(r"rec_[a-f0-9]{32}", recording_id):
+        raise HTTPException(status_code=404, detail="recording not found")
+    root = analyzed_recordings_root()
+    matches = list(root.glob(f"*/{recording_id}"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="recording not found")
+    target_dir = matches[0]
+    audio_files = [path for path in target_dir.glob("*.wav") if path.is_file()]
+    transcript_files = [path for path in target_dir.glob("*.txt") if path.is_file()]
+    if not audio_files or not transcript_files:
+        raise HTTPException(status_code=404, detail="recording not found")
+    return {
+        "recording_id": recording_id,
+        "upload_status": "uploaded",
+        "analysis_status": "not_requested",
+        "audio_size_bytes": audio_files[0].stat().st_size,
+        "transcript_size_bytes": transcript_files[0].stat().st_size,
+    }
