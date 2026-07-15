@@ -1,6 +1,7 @@
 package com.threemountain.lightasr
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.BroadcastReceiver
@@ -16,21 +17,31 @@ import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.InputType
 import android.text.method.ScrollingMovementMethod
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
+import com.k2fsa.sherpa.onnx.OfflineModelConfig
+import com.k2fsa.sherpa.onnx.OfflineParaformerModelConfig
 import com.k2fsa.sherpa.onnx.OfflineRecognizer
 import com.k2fsa.sherpa.onnx.OfflineRecognizerConfig
 import com.k2fsa.sherpa.onnx.getFeatureConfig
-import com.k2fsa.sherpa.onnx.getOfflineModelConfig
 import com.threemountain.lightasr.voiceprint.Employee
 import com.threemountain.lightasr.voiceprint.VoiceSample
 import com.threemountain.lightasr.voiceprint.VoiceprintManager
@@ -56,15 +67,15 @@ import kotlin.math.roundToLong
 import kotlin.math.sqrt
 
 private const val TAG = "LightASR"
-private const val MODEL_TYPE = 14
-private const val MODEL_DIR = "sherpa-onnx-paraformer-zh-small-2024-03-09"
+private const val MODEL_DIR = "sherpa-onnx-paraformer-zh-2024-03-09"
 private const val VAD_MODEL_ASSET = "models/vad/silero_vad.onnx"
+private const val DOMAIN_CORRECTIONS_ASSET = "models/text/domain_corrections.tsv"
 private const val TEST_WAV = "test.wav"
 private const val NO_SPEECH_MESSAGE = "未检测到有效人声，已跳过识别。"
-private const val FIXED_SEGMENT_SECONDS = 15.0
-private const val CHUNKED_SEGMENT_MS = 15_000L
-private const val CHUNKED_OVERLAP_MS = 1_500L
-private const val VAD_BOUNDARY_SEARCH_RADIUS_MS = 2_000L
+private const val FIXED_SEGMENT_SECONDS = 5.0
+private const val CHUNKED_SEGMENT_MS = 5_000L
+private const val CHUNKED_OVERLAP_MS = 800L
+private const val VAD_BOUNDARY_SEARCH_RADIUS_MS = 1_000L
 private const val VAD_BOUNDARY_MIN_SILENCE_MS = 300L
 private const val VAD_BOUNDARY_FRAME_MS = 20L
 private const val VAD_BOUNDARY_NOISE_MARGIN_DB = 8.0
@@ -73,9 +84,14 @@ private const val VAD_HOP_MS = 10L
 private const val VAD_MIN_SPEECH_MS = 300L
 private const val VAD_MIN_SILENCE_MS = 500L
 private const val VAD_SPEECH_PADDING_MS = 200L
-private const val VAD_MAX_SEGMENT_MS = 15_000L
+private const val VAD_MAX_SEGMENT_MS = 5_000L
 private const val VAD_MERGE_GAP_MS = 300L
 private const val VAD_MIN_SEGMENT_MS = 500L
+private const val NATURAL_VAD_SCAN_WINDOW_MS = 30_000L
+private const val NATURAL_VAD_SCAN_OVERLAP_MS = 1_000L
+private const val NATURAL_UTTERANCE_MERGE_GAP_MS = 450L
+private const val NATURAL_UTTERANCE_PADDING_MS = 220L
+private const val NATURAL_UTTERANCE_MIN_SPEECH_MS = 180L
 private const val SHARED_IMPORT_BUFFER_SIZE = 64 * 1024
 private const val SHARED_IMPORT_MAX_NAME_LENGTH = 120
 private const val SHARED_IMPORT_RETRY_COUNT = 8
@@ -84,9 +100,11 @@ private const val DEFAULT_RECORDING_START_TEXT = "2026-07-09 10:00:00.000"
 private const val DEFAULT_RECORDING_TIMEZONE_ID = "Asia/Shanghai"
 private const val DEDUP_MAX_CHECK_CHARS = 320
 private const val DEDUP_ACCUMULATED_TAIL_CHARS = 2_000
-private const val DEDUP_MIN_OVERLAP_CHARS = 4
+private const val DEDUP_MIN_OVERLAP_CHARS = 3
 private const val DEDUP_FUZZY_MIN_OVERLAP_CHARS = 8
 private const val DEDUP_FUZZY_THRESHOLD = 0.82
+private const val TRANSCRIPT_MAX_SENTENCE_NORM_CHARS = 32
+private const val STATE_PENDING_TXT_EXPORT_PATH = "pending_txt_export_path"
 
 private val ENERGY_VAD_CONFIG = EnergyVadConfig(
     frameMs = VAD_FRAME_MS,
@@ -111,6 +129,13 @@ enum class SharedImportStatus {
     RECEIVED,
     PENDING_TRANSCRIPTION,
     FAILED,
+}
+
+private enum class LightAsrPage {
+    HOME,
+    RESULT,
+    JOB_DETAIL,
+    VOICEPRINT,
 }
 
 data class SharedAudioRecord(
@@ -236,6 +261,15 @@ private data class ChunkRecognitionResult(
     val stats: TranscriptionStats,
 )
 
+private data class ResultPageState(
+    val displayName: String,
+    val output: RecognitionOutput,
+    val txtFile: File?,
+    val txtSaveError: String?,
+    val jobId: String?,
+    val audioSizeBytes: Long?,
+)
+
 private data class SilenceCandidate(
     val startMs: Long,
     val endMs: Long,
@@ -251,8 +285,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val txtDocumentCreator = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri ->
+        finishTxtExport(uri)
+    }
+
     private lateinit var pickAudioButton: Button
-    private lateinit var transcribeButton: Button
     private lateinit var transcribeSelectedButton: Button
     private lateinit var copyButton: Button
     private lateinit var startAirecReceiverButton: Button
@@ -262,7 +301,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var airecUploadRecordsView: TextView
     private lateinit var airecUploadRecordActions: LinearLayout
     private lateinit var sharedImportRecordsView: TextView
-    private lateinit var jobHistoryView: TextView
     private lateinit var jobHistoryActions: LinearLayout
     private lateinit var serverUrlInput: EditText
     private lateinit var serverTokenInput: EditText
@@ -281,6 +319,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var selectedAudioView: TextView
     private lateinit var resultView: TextView
     private lateinit var progressBar: ProgressBar
+    private lateinit var mainScrollView: ScrollView
+    private lateinit var pageRoot: LinearLayout
 
     private lateinit var voiceprintManager: VoiceprintManager
     private var recognizer: OfflineRecognizer? = null
@@ -289,6 +329,24 @@ class MainActivity : ComponentActivity() {
     private var selectedAudioFile: SelectedAudioFile? = null
     private var selectedVoiceprintEmployeeId: Long? = null
     private var activeTranscriptionJobId: String? = null
+    private var latestResultPageState: ResultPageState? = null
+    private var activeJobDetailId: String? = null
+    private var currentPage: LightAsrPage = LightAsrPage.HOME
+    private var platformBackCallback: OnBackInvokedCallback? = null
+    private var pendingTxtExportPath: String? = null
+    private val localSemanticCorrector: LocalSemanticCorrector by lazy {
+        runCatching {
+            val content = assets.open(DOMAIN_CORRECTIONS_ASSET)
+                .bufferedReader(Charsets.UTF_8)
+                .use { it.readText() }
+            LocalSemanticCorrector.fromTsv(content).also {
+                Log.i(TAG, "local semantic corrector ready rules=${it.ruleCount}")
+            }
+        }.getOrElse { error ->
+            Log.e(TAG, "local semantic corrector disabled asset=$DOMAIN_CORRECTIONS_ASSET", error)
+            LocalSemanticCorrector.empty()
+        }
+    }
     private val sharedAudioRecords = mutableListOf<SharedAudioRecord>()
     private var airecReceiverRegistered = false
     private val airecReceiverUpdates = object : BroadcastReceiver() {
@@ -296,17 +354,29 @@ class MainActivity : ComponentActivity() {
             activeTranscriptionJobId = TranscriptionForegroundService.activeJobId
             refreshAirecReceiverUi()
             refreshJobHistoryUi()
+            refreshResultPageIfVisible()
+            refreshJobDetailPageIfVisible()
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingTxtExportPath = savedInstanceState?.getString(STATE_PENDING_TXT_EXPORT_PATH)
         voiceprintManager = VoiceprintManager.create(this, assets)
         if (!TranscriptionForegroundService.isRunning) {
             TranscriptionJobRepository.markInterruptedJobs(this)
         }
         activeTranscriptionJobId = TranscriptionForegroundService.activeJobId
         buildUi()
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    handleAppBack()
+                }
+            },
+        )
+        registerPlatformBackCallback()
         refreshAirecReceiverUi()
         refreshSharedImportRecordsUi()
         refreshJobHistoryUi()
@@ -322,85 +392,72 @@ class MainActivity : ComponentActivity() {
         handleShareIntent(intent)
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        pendingTxtExportPath?.let { outState.putString(STATE_PENDING_TXT_EXPORT_PATH, it) }
+        super.onSaveInstanceState(outState)
+    }
+
     private fun buildUi() {
-        val scrollView = ScrollView(this)
-        val root = LinearLayout(this).apply {
+        mainScrollView = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor("#F6F8FC"))
+        }
+        pageRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            val padding = dp(16)
-            setPadding(padding, padding, padding, padding)
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-
-        val title = TextView(this).apply {
-            text = "LightASR"
-            textSize = 22f
-            gravity = Gravity.CENTER
-        }
-
-        val hint = TextView(this).apply {
-            text = "本地离线长录音转写，完成后可选择上传原音频和 TXT。"
-            textSize = 14f
-            setPadding(0, dp(8), 0, dp(12))
+            setPadding(dp(16), dp(24), dp(16), dp(20))
         }
 
         pickAudioButton = Button(this).apply {
-            text = "选择音频文件"
+            text = "选择音频开始分析"
+            stylePrimaryButton(this)
             setOnClickListener { pickAudioFile() }
         }
 
         selectedAudioView = TextView(this).apply {
             text = "未选择文件"
             textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFEFF3F8.toInt())
-        }
-
-        transcribeButton = Button(this).apply {
-            text = "识别内置测试音频"
-            isEnabled = false
-            setOnClickListener { transcribeBundledWav() }
+            setInfoBoxStyle(this, Color.parseColor("#F4F7FB"))
         }
 
         transcribeSelectedButton = Button(this).apply {
             text = "识别所选音频"
             isEnabled = false
+            stylePrimaryButton(this)
             setOnClickListener { transcribeSelectedAudio() }
         }
 
         copyButton = Button(this).apply {
             text = "复制结果"
             isEnabled = false
+            styleSecondaryButton(this)
             setOnClickListener { copyResult() }
         }
 
         airecReceiverStatusView = TextView(this).apply {
             textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFEFF3F8.toInt())
+            setInfoBoxStyle(this, Color.parseColor("#F4F7FB"))
         }
 
         startAirecReceiverButton = Button(this).apply {
             text = "开启接收模式"
+            stylePrimaryButton(this)
             setOnClickListener { startAirecReceiver() }
         }
 
         stopAirecReceiverButton = Button(this).apply {
             text = "停止接收模式"
+            styleSecondaryButton(this)
             setOnClickListener { stopAirecReceiver() }
         }
 
         copyAirecUrlButton = Button(this).apply {
             text = "复制上传地址"
+            styleSecondaryButton(this)
             setOnClickListener { copyAirecUploadUrl() }
         }
 
         airecUploadRecordsView = TextView(this).apply {
             textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFF3F6F4.toInt())
+            setInfoBoxStyle(this, Color.parseColor("#F7FAF8"))
         }
 
         airecUploadRecordActions = LinearLayout(this).apply {
@@ -409,17 +466,9 @@ class MainActivity : ComponentActivity() {
 
         sharedImportRecordsView = TextView(this).apply {
             textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFEFF3F8.toInt())
+            setInfoBoxStyle(this, Color.parseColor("#F4F7FB"))
         }
 
-        jobHistoryView = TextView(this).apply {
-            textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFF3F6F4.toInt())
-        }
         jobHistoryActions = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
         }
@@ -429,79 +478,81 @@ class MainActivity : ComponentActivity() {
             setHint("服务器地址")
             setSingleLine(true)
             setText(serverConfig.baseUrl)
+            setInputStyle(this)
         }
         serverTokenInput = EditText(this).apply {
             setHint("上传 Token（由管理员提供）")
             setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
             setText(serverConfig.uploadToken)
+            setInputStyle(this)
         }
         saveServerConfigButton = Button(this).apply {
             text = "保存服务器设置"
+            styleSecondaryButton(this)
             setOnClickListener { saveServerConfig() }
-        }
-
-        val voiceprintMarker = TextView(this).apply {
-            text = "如果你看到这一行，说明当前安装的是带声纹模型入口的测试版。"
-            textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFFFF6E6.toInt())
         }
 
         employeeNameInput = EditText(this).apply {
             setHint("员工姓名，例如：张三")
             setSingleLine(true)
+            setInputStyle(this)
         }
 
         employeeStoreInput = EditText(this).apply {
             setHint("门店，可选")
             setSingleLine(true)
+            setInputStyle(this)
         }
 
         voiceprintEmployeeView = TextView(this).apply {
             textSize = 14f
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFFFF6E6.toInt())
+            setInfoBoxStyle(this, Color.parseColor("#FFF7E8"), Color.parseColor("#F0D6A8"))
         }
 
         createEmployeeButton = Button(this).apply {
             text = "创建员工"
+            stylePrimaryButton(this)
             setOnClickListener { createVoiceprintEmployee() }
         }
 
         nextEmployeeButton = Button(this).apply {
             text = "选择下一个员工"
+            styleSecondaryButton(this)
             setOnClickListener { selectNextVoiceprintEmployee() }
         }
 
         addVoiceSampleButton = Button(this).apply {
             text = "添加所选音频为声纹样本"
             isEnabled = false
+            styleSecondaryButton(this)
             setOnClickListener { addVoiceprintSampleFromSelected() }
         }
 
         enrollVoiceprintButton = Button(this).apply {
             text = "执行声纹注册"
             isEnabled = false
+            styleSecondaryButton(this)
             setOnClickListener { enrollSelectedVoiceprintEmployee() }
         }
 
         identifySpeakerButton = Button(this).apply {
             text = "识别所选音频说话人"
             isEnabled = false
+            styleSecondaryButton(this)
             setOnClickListener { identifySelectedSpeaker() }
         }
 
         listEmployeesButton = Button(this).apply {
             text = "查看员工列表"
+            styleSecondaryButton(this)
             setOnClickListener { showVoiceprintEmployees() }
         }
 
         deleteEmployeeButton = Button(this).apply {
             text = "删除当前员工"
             isEnabled = false
+            styleSecondaryButton(this)
             setOnClickListener { deleteSelectedVoiceprintEmployee() }
         }
 
@@ -512,100 +563,70 @@ class MainActivity : ComponentActivity() {
         statusView = TextView(this).apply {
             text = "正在初始化模型..."
             textSize = 14f
-            setPadding(0, dp(12), 0, dp(8))
+            setInfoBoxStyle(this, Color.parseColor("#F4F7FB"))
         }
 
         resultView = TextView(this).apply {
             text = ""
             textSize = 15f
             movementMethod = ScrollingMovementMethod()
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(0xFFF3F6F4.toInt())
+            setInfoBoxStyle(this, Color.parseColor("#F7FAF8"))
         }
 
-        root.addView(title, matchWrap())
-        root.addView(hint, matchWrap())
-        root.addView(
+        mainScrollView.addView(pageRoot)
+        setContentView(mainScrollView)
+        showHomePage()
+    }
+
+    private fun showHomePage() {
+        currentPage = LightAsrPage.HOME
+        activeJobDetailId = null
+        pageRoot.removeAllViews()
+        pageRoot.addView(buildHomeHeader(), matchWrap())
+        pageRoot.addView(buildStatusCard(), sectionWrap())
+        pageRoot.addView(buildStartAnalysisCard(), sectionWrap())
+        pageRoot.addView(buildRecentTasksCard(), sectionWrap())
+        pageRoot.addView(buildAirecReceiverCard(), sectionWrap())
+        pageRoot.addView(buildVoiceprintEntryCard(), sectionWrap())
+        pageRoot.addView(
             buildSection(
-                "正式音频分析",
-                "选择 WAV 后进入本地 VAD + ASR",
-                0xFFEFF3F8.toInt(),
-                pickAudioButton,
-                selectedAudioView,
-                transcribeSelectedButton,
-                transcribeButton,
-            ),
-            sectionWrap(),
-        )
-        root.addView(
-            buildSection(
-                "任务记录",
-                "长录音会持续保存进度；中断后可继续，完成后可上传",
-                0xFFF3F6F4.toInt(),
-                jobHistoryView,
-                jobHistoryActions,
-            ),
-            sectionWrap(),
-        )
-        root.addView(
-            buildSection(
-                "服务器上传",
-                "仅在本地分析完成后，由用户手动上传 WAV 和 TXT",
-                0xFFEFF3F8.toInt(),
+                "服务器设置",
+                "本地分析完成后，可手动上传 WAV 和 TXT 到 Zeabur 后端",
                 serverUrlInput,
                 serverTokenInput,
                 saveServerConfigButton,
             ),
             sectionWrap(),
         )
-        root.addView(
-            buildSection(
-                "Android 分享导入",
-                "从其他录音 App 分享历史 WAV",
-                0xFFF3F6F4.toInt(),
-                sharedImportRecordsView,
-            ),
-            sectionWrap(),
-        )
-        root.addView(
-            buildSection(
-                "AIREC 局域网接收",
-                "同一 Wi-Fi 下接收 AIREC 自动上传",
-                0xFFEFF3F8.toInt(),
-                airecReceiverStatusView,
-                startAirecReceiverButton,
-                stopAirecReceiverButton,
-                copyAirecUrlButton,
-                airecUploadRecordsView,
-                airecUploadRecordActions,
-            ),
-            sectionWrap(),
-        )
-        root.addView(
+        scrollCurrentPageToTop()
+    }
+
+    private fun showVoiceprintPage() {
+        currentPage = LightAsrPage.VOICEPRINT
+        activeJobDetailId = null
+        pageRoot.removeAllViews()
+        pageRoot.addView(buildVoiceprintHeader(), matchWrap())
+        pageRoot.addView(
             buildSection(
                 "员工声纹实验功能",
-                "不进入第一版正式转写结果，仅用于短音频验证",
-                0xFFFFF6E6.toInt(),
-                voiceprintMarker,
+                "用于短音频注册和识别验证；未接入真实模型时只提示未就绪",
+                buildVoiceprintMarkerText(),
+                selectedAudioView,
+                pickAudioButton,
                 employeeNameInput,
                 employeeStoreInput,
                 voiceprintEmployeeView,
-                createEmployeeButton,
-                nextEmployeeButton,
-                addVoiceSampleButton,
-                enrollVoiceprintButton,
+                buildButtonRow(createEmployeeButton, nextEmployeeButton),
+                buildButtonRow(addVoiceSampleButton, enrollVoiceprintButton),
                 identifySpeakerButton,
-                listEmployeesButton,
-                deleteEmployeeButton,
+                buildButtonRow(listEmployeesButton, deleteEmployeeButton),
             ),
             sectionWrap(),
         )
-        root.addView(
+        pageRoot.addView(
             buildSection(
-                "运行状态与结果",
+                "声纹运行状态",
                 null,
-                0xFFF7F7F7.toInt(),
                 progressBar,
                 statusView,
                 resultView,
@@ -613,28 +634,730 @@ class MainActivity : ComponentActivity() {
             ),
             sectionWrap(),
         )
+        scrollCurrentPageToTop()
+    }
 
-        scrollView.addView(root)
-        setContentView(scrollView)
+    private fun showResultPage(state: ResultPageState, scrollToTop: Boolean = true) {
+        currentPage = LightAsrPage.RESULT
+        activeJobDetailId = null
+        latestResultPageState = state
+        pageRoot.removeAllViews()
+        pageRoot.addView(buildResultHeader(), matchWrap())
+        pageRoot.addView(buildResultCompleteCard(state), sectionWrap())
+        pageRoot.addView(buildTxtFileCard(state), sectionWrap())
+        pageRoot.addView(buildUploadServerCard(state), sectionWrap())
+        pageRoot.addView(buildResultStatsCard(state.output.stats, state.output.segments.size), sectionWrap())
+        pageRoot.addView(buildTranscriptPreviewCard(state), sectionWrap())
+        if (scrollToTop) scrollCurrentPageToTop()
+    }
+
+    private fun showJobDetailPage(jobId: String, scrollToTop: Boolean = true) {
+        val job = TranscriptionJobRepository.get(this, jobId) ?: run {
+            setStatus("任务记录不存在")
+            showHomePage()
+            return
+        }
+        currentPage = LightAsrPage.JOB_DETAIL
+        activeJobDetailId = job.id
+        pageRoot.removeAllViews()
+        pageRoot.addView(buildJobDetailHeader(), matchWrap())
+        pageRoot.addView(buildJobDetailInfoCard(job), sectionWrap())
+        pageRoot.addView(buildJobUploadServerCard(job), sectionWrap())
+        pageRoot.addView(buildJobTranscriptCard(job), sectionWrap())
+        if (scrollToTop) scrollCurrentPageToTop()
+    }
+
+    private fun handleAppBack() {
+        if (currentPage == LightAsrPage.HOME) {
+            finish()
+        } else {
+            goHomeFromSubpage("system back from $currentPage")
+        }
+    }
+
+    private fun registerPlatformBackCallback() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val callback = OnBackInvokedCallback { handleAppBack() }
+            platformBackCallback = callback
+            onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+                callback,
+            )
+        }
+    }
+
+    private fun unregisterPlatformBackCallback() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            platformBackCallback?.let { callback ->
+                onBackInvokedDispatcher.unregisterOnBackInvokedCallback(callback)
+            }
+            platformBackCallback = null
+        }
+    }
+
+    @Deprecated("Use OnBackPressedDispatcher on newer Android versions")
+    override fun onBackPressed() {
+        handleAppBack()
+    }
+
+    private fun goHomeFromSubpage(reason: String) {
+        Log.i(TAG, "navigate home: $reason")
+        showHomePage()
+    }
+
+    private fun scrollCurrentPageToTop() {
+        if (::mainScrollView.isInitialized) {
+            mainScrollView.post { mainScrollView.scrollTo(0, 0) }
+        }
+    }
+
+    private fun buildResultHeader(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(buildTopBackButton("result header back"), LinearLayout.LayoutParams(dp(56), dp(48)))
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "识别结果"
+                    textSize = 28f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor("#111827"))
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(dp(48), dp(48)))
+        }
+    }
+
+    private fun buildJobDetailHeader(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(buildTopBackButton("job detail back"), LinearLayout.LayoutParams(dp(56), dp(48)))
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "任务详情"
+                    textSize = 28f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor("#111827"))
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            addView(View(this@MainActivity), LinearLayout.LayoutParams(dp(48), dp(48)))
+        }
+    }
+
+    private fun buildTopBackButton(reason: String): Button {
+        return Button(this).apply {
+            text = "‹"
+            textSize = 30f
+            typeface = Typeface.DEFAULT_BOLD
+            isAllCaps = false
+            contentDescription = "返回主页"
+            setTextColor(Color.parseColor("#111827"))
+            background = roundedBackground(
+                fillColor = Color.TRANSPARENT,
+                strokeColor = Color.TRANSPARENT,
+                radiusDp = 8,
+            )
+            setOnClickListener { goHomeFromSubpage(reason) }
+        }
+    }
+
+    private fun buildJobDetailInfoCard(job: TranscriptionJob): LinearLayout {
+        return buildSection(
+            "文件信息",
+            null,
+            TextView(this).apply {
+                text = buildString {
+                    appendLine("文件名：${job.sourceName}")
+                    appendLine("状态：${jobStatusText(job.status)}")
+                    appendLine("进度：${job.progressPercent}%")
+                    appendLine("音频时长：${formatJobDuration(job.durationMs)}")
+                    appendLine("来源：${job.sourceType}")
+                    job.errorMessage?.takeIf { it.isNotBlank() }?.let { appendLine("提示：$it") }
+                    job.serverRecordingId?.takeIf { it.isNotBlank() }?.let { appendLine("服务器记录：$it") }
+                }.trim()
+                textSize = 14f
+                setInfoBoxStyle(this, Color.parseColor("#F4F7FB"))
+            },
+        )
+    }
+
+    private fun buildJobUploadServerCard(job: TranscriptionJob): LinearLayout {
+        val progress = job.progressPercent.coerceIn(0, 100)
+        val canUpload = job.status in setOf(
+            TranscriptionJobStatus.LOCAL_COMPLETED,
+            TranscriptionJobStatus.UPLOAD_FAILED,
+        )
+        val statusBox = TextView(this).apply {
+            text = when (job.status) {
+                TranscriptionJobStatus.UPLOADING -> "${job.errorMessage ?: "上传中"} $progress%"
+                TranscriptionJobStatus.UPLOADED -> "上传成功：${job.serverRecordingId ?: "服务器已接收"}"
+                TranscriptionJobStatus.UPLOAD_FAILED -> job.errorMessage ?: "上传失败"
+                TranscriptionJobStatus.LOCAL_COMPLETED -> "TXT 已生成，可上传 WAV 和 TXT"
+                else -> "本地分析完成后才可上传"
+            }
+            textSize = 14f
+            setInfoBoxStyle(
+                this,
+                if (job.status == TranscriptionJobStatus.UPLOAD_FAILED) Color.parseColor("#FFF7E8")
+                else Color.parseColor("#F4F7FB"),
+                if (job.status == TranscriptionJobStatus.UPLOAD_FAILED) Color.parseColor("#F0D6A8")
+                else Color.parseColor("#E5EAF2"),
+            )
+        }
+        val uploadProgressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            this.progress = progress
+            visibility = if (job.status in setOf(
+                    TranscriptionJobStatus.UPLOADING,
+                    TranscriptionJobStatus.UPLOADED,
+                    TranscriptionJobStatus.UPLOAD_FAILED,
+                )
+            ) View.VISIBLE else View.GONE
+        }
+        val children = mutableListOf<View>(statusBox, uploadProgressBar)
+        if (canUpload) {
+            children += Button(this).apply {
+                text = if (job.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传" else "上传到服务器"
+                stylePrimaryButton(this)
+                isEnabled = activeTranscriptionJobId == null
+                setOnClickListener { uploadJob(job.id) }
+            }
+        }
+        return buildSection("上传服务器", null, *children.toTypedArray())
+    }
+
+    private fun buildJobTranscriptCard(job: TranscriptionJob): LinearLayout {
+        val transcriptFile = job.transcriptPath?.let(::File)?.takeIf { it.isFile }
+        val transcriptPreview = transcriptFile
+            ?.useLines(Charsets.UTF_8) { lines ->
+                lines
+                    .map { it.trimEnd() }
+                    .filter { it.isNotBlank() }
+                    .take(12)
+                    .joinToString("\n")
+            }
+            ?: "TXT 文件尚未生成"
+        val children = mutableListOf<View>(
+            TextView(this).apply {
+                text = transcriptPreview
+                textSize = 14f
+                setInfoBoxStyle(this, Color.parseColor("#F7FAF8"))
+            }
+        )
+        if (transcriptFile != null) {
+            children += buildTxtActionPanel(transcriptFile)
+        }
+        return buildSection(
+            "识别文本预览",
+            transcriptFile?.let { "${it.name} · 可保存到手机、查看全文或分享" },
+            *children.toTypedArray(),
+        )
+    }
+
+    private fun buildResultCompleteCard(state: ResultPageState): LinearLayout {
+        return buildCard().apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "✓"
+                            textSize = 18f
+                            gravity = Gravity.CENTER
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(Color.parseColor("#10A66E"))
+                            background = roundedBackground(
+                                fillColor = Color.parseColor("#EAFBF2"),
+                                strokeColor = Color.TRANSPARENT,
+                                radiusDp = 12,
+                            )
+                        },
+                        LinearLayout.LayoutParams(dp(82), dp(82)).apply {
+                            setMargins(0, 0, dp(16), 0)
+                        },
+                    )
+                    addView(
+                        LinearLayout(this@MainActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                            addView(
+                                TextView(this@MainActivity).apply {
+                                    text = if (state.txtSaveError == null) "识别完成" else "识别完成，TXT 保存失败"
+                                    textSize = 24f
+                                    typeface = Typeface.DEFAULT_BOLD
+                                    setTextColor(Color.parseColor("#111827"))
+                                },
+                                matchWrap(),
+                            )
+                            addView(
+                                TextView(this@MainActivity).apply {
+                                    text = if (state.txtSaveError == null) {
+                                        "TXT 结果已生成，可以继续上传服务器"
+                                    } else {
+                                        state.txtSaveError
+                                    }
+                                    textSize = 15f
+                                    setTextColor(Color.parseColor("#5D6675"))
+                                    setPadding(0, dp(4), 0, dp(10))
+                                },
+                                matchWrap(),
+                            )
+                            addView(
+                                TextView(this@MainActivity).apply {
+                                    text = "♫ ${state.displayName}\n${formatTxtTimestamp(state.output.stats.totalDurationMs)} · ${formatBytes(state.audioSizeBytes)}"
+                                    textSize = 14f
+                                    setTextColor(Color.parseColor("#5D6675"))
+                                },
+                                matchWrap(),
+                            )
+                        },
+                        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+                    )
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "TXT"
+                            textSize = 24f
+                            gravity = Gravity.CENTER
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(Color.parseColor("#8AAEF8"))
+                            background = roundedBackground(
+                                fillColor = Color.parseColor("#EEF4FF"),
+                                strokeColor = Color.TRANSPARENT,
+                                radiusDp = 14,
+                            )
+                        },
+                        LinearLayout.LayoutParams(dp(96), dp(116)),
+                    )
+                },
+                matchWrap(),
+            )
+        }
+    }
+
+    private fun buildResultStatsCard(stats: TranscriptionStats, segmentCount: Int): LinearLayout {
+        return buildCard().apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(buildStatCell("总时长", formatTxtTimestamp(stats.totalDurationMs), "#1263EA"), statCellParams())
+            addView(buildStatCell("人声时长", formatTxtTimestamp(stats.speechDurationMs), "#16A34A"), statCellParams())
+            addView(buildStatCell("跳过噪音", formatTxtTimestamp(stats.skippedNoSpeechDurationMs), "#F97316"), statCellParams())
+            addView(buildStatCell("分段数量", "$segmentCount 段", "#7C3AED"), statCellParams())
+        }
+    }
+
+    private fun buildTxtFileCard(state: ResultPageState): LinearLayout {
+        val transcriptFile = state.txtFile?.takeIf { it.isFile && it.length() > 0L }
+        val description = when {
+            transcriptFile != null -> "${transcriptFile.name} · 已生成应用内副本，请保存到手机以便在文件管理器中查看"
+            !state.txtSaveError.isNullOrBlank() -> state.txtSaveError
+            else -> "TXT 尚未生成"
+        }
+        return buildSection(
+            "TXT 结果文件",
+            description,
+            buildTxtActionPanel(transcriptFile),
+        )
+    }
+
+    private fun buildTxtActionPanel(transcriptFile: File?): LinearLayout {
+        val fileReady = transcriptFile?.let { it.isFile && it.length() > 0L } == true
+        val saveButton = Button(this).apply {
+            text = "保存到手机"
+            isEnabled = fileReady
+            stylePrimaryButton(this)
+            setOnClickListener {
+                transcriptFile?.let(::exportTxtToUserLocation)
+            }
+        }
+        val viewButton = Button(this).apply {
+            text = "查看全文"
+            isEnabled = fileReady
+            styleSecondaryButton(this)
+            setOnClickListener {
+                transcriptFile?.let(::showTxtFile)
+            }
+        }
+        val shareButton = Button(this).apply {
+            text = "分享 TXT"
+            isEnabled = fileReady
+            styleSecondaryButton(this)
+            setOnClickListener {
+                transcriptFile?.let(::shareTxtFile)
+            }
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(saveButton, matchWrap())
+            addView(buildButtonRow(viewButton, shareButton), childWrap(topMargin = 8))
+        }
+    }
+
+    private fun buildUploadServerCard(state: ResultPageState): LinearLayout {
+        val uploadedJob = state.jobId?.let { TranscriptionJobRepository.get(this, it) }
+        val uploadText = when (uploadedJob?.status) {
+            TranscriptionJobStatus.UPLOADED -> "已上传：${uploadedJob.serverRecordingId ?: "服务器已接收"}"
+            TranscriptionJobStatus.UPLOADING -> "${uploadedJob.errorMessage ?: "上传中"}：${uploadedJob.progressPercent}%"
+            TranscriptionJobStatus.UPLOAD_FAILED -> "上次上传失败，可重试"
+            else -> "TXT 已生成，可将 WAV 和 TXT 上传服务器归档"
+        }
+        val progress = uploadedJob?.progressPercent?.coerceIn(0, 100) ?: 0
+        val statusBox = TextView(this).apply {
+            text = when (uploadedJob?.status) {
+                TranscriptionJobStatus.UPLOADING -> "${uploadedJob.errorMessage ?: "上传进度"} $progress%"
+                TranscriptionJobStatus.UPLOADED -> "上传进度 100%"
+                TranscriptionJobStatus.UPLOAD_FAILED -> uploadedJob.errorMessage ?: "上传失败"
+                else -> if (state.jobId == null) "内置测试音频不创建上传任务" else "等待上传"
+            }
+            textSize = 14f
+            setInfoBoxStyle(
+                this,
+                if (uploadedJob?.status == TranscriptionJobStatus.UPLOAD_FAILED) Color.parseColor("#FFF7E8")
+                else Color.parseColor("#F4F7FB"),
+                if (uploadedJob?.status == TranscriptionJobStatus.UPLOAD_FAILED) Color.parseColor("#F0D6A8")
+                else Color.parseColor("#E5EAF2"),
+            )
+        }
+        val uploadProgressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            this.progress = progress
+            visibility = if (uploadedJob?.status in setOf(
+                    TranscriptionJobStatus.UPLOADING,
+                    TranscriptionJobStatus.UPLOADED,
+                    TranscriptionJobStatus.UPLOAD_FAILED,
+                )
+            ) View.VISIBLE else View.GONE
+        }
+        val children = mutableListOf<View>(statusBox, uploadProgressBar)
+        val jobId = state.jobId
+        if (jobId != null) {
+            children += Button(this).apply {
+                text = if (uploadedJob?.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传" else "上传到服务器"
+                stylePrimaryButton(this)
+                isEnabled = uploadedJob?.status != TranscriptionJobStatus.UPLOADING
+                setOnClickListener { uploadJob(jobId) }
+            }
+        }
+        return buildSection(
+            "上传服务器",
+            uploadText,
+            *children.toTypedArray(),
+        )
+    }
+
+    private fun buildTranscriptPreviewCard(state: ResultPageState): LinearLayout {
+        val preview = buildTranscriptPreview(state.output)
+        return buildSection(
+            "识别文本预览",
+            null,
+            TextView(this).apply {
+                text = preview
+                textSize = 15f
+                setInfoBoxStyle(this, Color.parseColor("#F4F7FB"))
+            },
+            TextView(this).apply {
+                text = "仅预览前 5 段，可在上方查看全文、保存到手机或分享 TXT。"
+                textSize = 13f
+                setTextColor(Color.parseColor("#6B7280"))
+            },
+        )
+    }
+
+    private fun buildHomeHeader(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "LightASR"
+                            textSize = 30f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(Color.parseColor("#111827"))
+                        },
+                        matchWrap(),
+                    )
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "离线语音转文字工作台"
+                            textSize = 16f
+                            setTextColor(Color.parseColor("#5D6675"))
+                            setPadding(0, dp(6), 0, dp(12))
+                        },
+                        matchWrap(),
+                    )
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "?"
+                    textSize = 20f
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.parseColor("#4B5563"))
+                    background = roundedBackground(
+                        fillColor = Color.WHITE,
+                        strokeColor = Color.parseColor("#D9E2F0"),
+                        radiusDp = 18,
+                    )
+                },
+                LinearLayout.LayoutParams(dp(38), dp(38)),
+            )
+        }
+    }
+
+    private fun buildStartAnalysisCard(): LinearLayout {
+        return buildCard().apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "开始一次新的录音整理"
+                            textSize = 22f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(Color.parseColor("#111827"))
+                        },
+                        matchWrap(),
+                    )
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "适合处理 1 小时以上 WAV 录音"
+                            textSize = 15f
+                            setTextColor(Color.parseColor("#5D6675"))
+                            setPadding(0, dp(6), 0, dp(12))
+                        },
+                        matchWrap(),
+                    )
+                    detachFromParent(pickAudioButton)
+                    addView(pickAudioButton, matchWrap())
+                    detachFromParent(selectedAudioView)
+                    addView(selectedAudioView, childWrap(topMargin = 10))
+                    detachFromParent(transcribeSelectedButton)
+                    addView(transcribeSelectedButton, childWrap(topMargin = 8))
+                },
+                matchWrap(),
+            )
+        }
+    }
+
+    private fun buildStatusCard(): LinearLayout {
+        val latestJob = TranscriptionJobRepository.list(this).firstOrNull()
+        val statusText = if (activeTranscriptionJobId != null) {
+            "处理中"
+        } else {
+            "空闲"
+        }
+        val detailText = latestJob?.let {
+            "最近一次任务：${it.sourceName} · ${jobStatusText(it.status)}"
+        } ?: "系统就绪，可开始新的音频分析任务"
+        return buildCard().apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "当前状态"
+                    textSize = 18f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor("#111827"))
+                },
+                matchWrap(),
+            )
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = statusText
+                            textSize = 24f
+                            typeface = Typeface.DEFAULT_BOLD
+                            gravity = Gravity.CENTER
+                            setTextColor(if (activeTranscriptionJobId == null) Color.parseColor("#138A3D") else Color.parseColor("#1263EA"))
+                            background = roundedBackground(
+                                fillColor = if (activeTranscriptionJobId == null) Color.parseColor("#E7F8EA") else Color.parseColor("#EEF4FF"),
+                                strokeColor = Color.TRANSPARENT,
+                                radiusDp = 8,
+                            )
+                        },
+                        LinearLayout.LayoutParams(dp(104), dp(58)).apply {
+                            setMargins(0, 0, dp(18), 0)
+                        },
+                    )
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = detailText
+                            textSize = 15f
+                            setTextColor(Color.parseColor("#374151"))
+                        },
+                        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+                    )
+                },
+                childWrap(topMargin = 14),
+            )
+            addView(statusView, childWrap(topMargin = 12))
+            addView(progressBar, childWrap(topMargin = 8))
+        }
+    }
+
+    private fun buildRecentTasksCard(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(sectionTitle("最近任务"), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                },
+                matchWrap(),
+            )
+            addView(jobHistoryActions, childWrap(topMargin = 12))
+        }
+    }
+
+    private fun buildAirecReceiverCard(): LinearLayout {
+        return buildCard().apply {
+            orientation = LinearLayout.VERTICAL
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "▰"
+                            textSize = 26f
+                            gravity = Gravity.CENTER
+                            setTextColor(Color.parseColor("#16A34A"))
+                            background = roundedBackground(
+                                fillColor = Color.parseColor("#F0FDF4"),
+                                strokeColor = Color.TRANSPARENT,
+                                radiusDp = 12,
+                            )
+                        },
+                        LinearLayout.LayoutParams(dp(66), dp(66)).apply {
+                            setMargins(0, 0, dp(14), 0)
+                        },
+                    )
+                    addView(
+                        LinearLayout(this@MainActivity).apply {
+                            orientation = LinearLayout.VERTICAL
+                            addView(
+                                TextView(this@MainActivity).apply {
+                                    text = "AIREC 接收模式"
+                                    textSize = 18f
+                                    typeface = Typeface.DEFAULT_BOLD
+                                    setTextColor(Color.parseColor("#111827"))
+                                },
+                                matchWrap(),
+                            )
+                            addView(airecReceiverStatusView, childWrap(topMargin = 8))
+                        },
+                        LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+                    )
+                },
+                matchWrap(),
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = AirecNetwork.uploadUrl()
+                    textSize = 14f
+                    setTextColor(Color.parseColor("#111827"))
+                    setInfoBoxStyle(this, Color.parseColor("#F8FAFD"))
+                },
+                childWrap(topMargin = 12),
+            )
+            addView(buildButtonRow(startAirecReceiverButton, stopAirecReceiverButton, copyAirecUrlButton), childWrap(topMargin = 12))
+            addView(airecUploadRecordsView, childWrap(topMargin = 12))
+            addView(airecUploadRecordActions, childWrap(topMargin = 8))
+        }
+    }
+
+    private fun buildVoiceprintEntryCard(): LinearLayout {
+        return buildCard().apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
+            contentDescription = "进入声纹识别页面"
+            setOnClickListener { showVoiceprintPage() }
+            addView(
+                LinearLayout(this@MainActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "声纹识别（实验功能）"
+                            textSize = 18f
+                            typeface = Typeface.DEFAULT_BOLD
+                            setTextColor(Color.parseColor("#111827"))
+                        },
+                        matchWrap(),
+                    )
+                    addView(
+                        TextView(this@MainActivity).apply {
+                            text = "注册员工声音样本，后续用于标注不同说话人"
+                            textSize = 14f
+                            setTextColor(Color.parseColor("#5D6675"))
+                            setPadding(0, dp(5), 0, 0)
+                        },
+                        matchWrap(),
+                    )
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "⌄"
+                    textSize = 24f
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.parseColor("#374151"))
+                },
+                LinearLayout.LayoutParams(dp(44), dp(44)),
+            )
+        }
+    }
+
+    private fun buildVoiceprintHeader(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(buildTopBackButton("voiceprint header back"), LinearLayout.LayoutParams(dp(56), dp(48)))
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = "声纹识别"
+                    textSize = 26f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor("#111827"))
+                    setPadding(dp(12), 0, 0, 0)
+                },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f),
+            )
+        }
+    }
+
+    private fun buildVoiceprintMarkerText(): TextView {
+        return TextView(this).apply {
+            text = "当前声纹模块用于验证员工注册、样本保存和匹配流程。真实声纹模型不可用时会显示“模型未就绪”，不会影响正式录音转文字。"
+            textSize = 14f
+            setInfoBoxStyle(this, Color.parseColor("#FFF7E8"), Color.parseColor("#F0D6A8"))
+        }
     }
 
     private fun buildSection(
         title: String,
         subtitle: String?,
-        backgroundColor: Int,
         vararg children: View,
     ): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            val padding = dp(12)
-            setPadding(padding, padding, padding, padding)
-            setBackgroundColor(backgroundColor)
-
+        return buildCard().apply {
             addView(
                 TextView(this@MainActivity).apply {
                     text = title
-                    textSize = 18f
-                    setPadding(0, 0, 0, dp(4))
+                    textSize = 19f
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor("#111827"))
                 },
                 matchWrap(),
             )
@@ -643,16 +1366,16 @@ class MainActivity : ComponentActivity() {
                 addView(
                     TextView(this@MainActivity).apply {
                         text = subtitle
-                        textSize = 13f
-                        setPadding(0, 0, 0, dp(8))
+                        textSize = 14f
+                        setTextColor(Color.parseColor("#5D6675"))
                     },
-                    matchWrap(),
+                    childWrap(topMargin = 5),
                 )
             }
 
             children.forEach { child ->
-                val params = if (child is ProgressBar) wrapWrap() else matchWrap()
-                addView(child, params)
+                detachFromParent(child)
+                addView(child, childWrap())
             }
         }
     }
@@ -1213,13 +1936,14 @@ AIREC 接收模式：$stateText
     }
 
     private fun buildSelectedAudioText(file: SelectedAudioFile): String {
-        return """
-已选择文件
-文件名: ${file.displayName ?: "未知"}
-MIME: ${file.mimeType ?: "未知"}
-大小: ${file.sizeBytes?.toString() ?: "未知"} bytes
-Uri: ${file.uri}
-""".trim()
+        return buildString {
+            appendLine("已选择：${file.displayName ?: "未知文件"}")
+            append("大小：${formatBytes(file.sizeBytes)}")
+            if (!isSupportedWav(file)) {
+                appendLine()
+                append("当前仅支持 WAV 文件")
+            }
+        }
     }
 
     private fun isSupportedWav(fileInfo: SelectedAudioFile): Boolean {
@@ -1245,7 +1969,6 @@ Uri: ${file.uri}
     }
 
     private fun initRecognizerAsync() {
-        transcribeButton.isEnabled = false
         progressBar.visibility = View.VISIBLE
 
         thread(name = "init-asr") {
@@ -1266,88 +1989,40 @@ Uri: ${file.uri}
 
                 val config = OfflineRecognizerConfig(
                     featConfig = getFeatureConfig(sampleRate = 16000, featureDim = 80),
-                    modelConfig = getOfflineModelConfig(MODEL_TYPE)!!,
+                    modelConfig = OfflineModelConfig(
+                        paraformer = OfflineParaformerModelConfig(
+                            model = "$MODEL_DIR/model.int8.onnx",
+                        ),
+                        tokens = "$MODEL_DIR/tokens.txt",
+                        modelType = "paraformer",
+                    ),
                 )
 
                 recognizer = OfflineRecognizer(assetManager = assets, config = config)
                 speechGate = SpeechGate(
                     assetManager = assets,
-                    config = SpeechGateConfig(modelAssetPath = VAD_MODEL_ASSET),
+                    config = SpeechGateConfig(
+                        modelAssetPath = VAD_MODEL_ASSET,
+                        minSpeechMs = NATURAL_UTTERANCE_MIN_SPEECH_MS,
+                        minSpeechRatio = 0.005f,
+                        speechPadMs = 0L,
+                        mergeGapMs = 0L,
+                        modelMinSilenceDurationSec = 0.25f,
+                        modelMinSpeechDurationSec = 0.18f,
+                        modelMaxSpeechDurationSec = 30.0f,
+                    ),
                 )
 
                 runOnUiThread {
                     progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = true
                     updateSelectedAudioButtonState()
                     refreshAirecReceiverUi()
-                    setStatus("ASR 和人声检测模型已就绪，可以识别内置测试音频。")
+                    setStatus("ASR 和人声检测模型已就绪，可以选择 WAV 文件开始分析。")
                 }
             } catch (t: Throwable) {
                 runOnUiThread {
                     progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = false
                     setStatus("模型初始化失败：${t.message ?: t::class.java.simpleName}")
-                }
-            }
-        }
-    }
-
-    private fun transcribeBundledWav() {
-        val currentRecognizer = recognizer ?: run {
-            setStatus("模型尚未就绪")
-            return
-        }
-
-        progressBar.visibility = View.VISIBLE
-        transcribeButton.isEnabled = false
-        transcribeSelectedButton.isEnabled = false
-        copyButton.isEnabled = false
-        resultView.text = ""
-        setStatus("正在识别 $TEST_WAV ...")
-
-        thread(name = "transcribe-bundled-wav") {
-            try {
-                val wavFile = copyAssetToCache(TEST_WAV, "builtin_test.wav")
-                val output = recognizeWavFile(
-                    currentRecognizer = currentRecognizer,
-                    wavFile = wavFile,
-                    sourceFileName = TEST_WAV,
-                )
-                val txtContent = buildTimestampedTxt(
-                    sourceFileName = TEST_WAV,
-                    output = output,
-                )
-                var txtFile: File? = null
-                var txtSaveError: String? = null
-                try {
-                    txtFile = saveTimestampedTxt(TEST_WAV, txtContent)
-                } catch (t: Throwable) {
-                    txtSaveError = t.message ?: t::class.java.simpleName
-                }
-                lastOutput = buildFullOutput(TEST_WAV, output, txtFile, txtSaveError)
-
-                runOnUiThread {
-                    progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = true
-                    updateSelectedAudioButtonState()
-                    copyButton.isEnabled = lastOutput.isNotBlank()
-                    resultView.text = lastOutput
-                    setStatus(
-                        if (!output.stats.hasAnySpeech) {
-                            NO_SPEECH_MESSAGE
-                        } else if (txtSaveError == null) {
-                            "识别完成：$TEST_WAV"
-                        } else {
-                            "TXT 保存失败：$txtSaveError"
-                        }
-                    )
-                }
-            } catch (t: Throwable) {
-                runOnUiThread {
-                    progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = true
-                    updateSelectedAudioButtonState()
-                    setStatus("识别失败：${t.message ?: t::class.java.simpleName}")
                 }
             }
         }
@@ -1377,7 +2052,6 @@ Uri: ${file.uri}
         activeTranscriptionJobId = job.id
         requestNotificationPermissionIfNeeded()
         progressBar.visibility = View.VISIBLE
-        transcribeButton.isEnabled = false
         transcribeSelectedButton.isEnabled = false
         copyButton.isEnabled = false
         resultView.text = ""
@@ -1406,10 +2080,19 @@ Uri: ${file.uri}
                 }
                 runOnUiThread {
                     progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = true
                     updateSelectedAudioButtonState()
                     copyButton.isEnabled = true
                     resultView.text = lastOutput
+                    showResultPage(
+                        ResultPageState(
+                            displayName = displayName,
+                            output = output,
+                            txtFile = txtFile,
+                            txtSaveError = null,
+                            jobId = job.id,
+                            audioSizeBytes = wavFile.length(),
+                        )
+                    )
                     setStatus(if (!output.stats.hasAnySpeech) NO_SPEECH_MESSAGE else "本地分析完成：" + displayName)
                     refreshJobHistoryUi()
                 }
@@ -1425,7 +2108,6 @@ Uri: ${file.uri}
                 lastOutput = if (canceled) "任务已取消" else "识别失败：\n" + message
                 runOnUiThread {
                     progressBar.visibility = View.GONE
-                    transcribeButton.isEnabled = true
                     updateSelectedAudioButtonState()
                     resultView.text = lastOutput
                     setStatus(lastOutput)
@@ -1546,71 +2228,143 @@ Uri: ${file.uri}
     }
 
     private fun refreshJobHistoryUi() {
-        if (!::jobHistoryView.isInitialized) return
-        val jobs = TranscriptionJobRepository.list(this)
-        jobHistoryView.text = if (jobs.isEmpty()) "暂无分析任务" else buildString {
-            jobs.take(8).forEachIndexed { index, job ->
-                if (index > 0) appendLine()
-                appendLine((index + 1).toString() + ". " + job.sourceName)
-                appendLine("状态：" + jobStatusText(job.status) + "  进度：" + job.progressPercent + "%")
-                if (job.totalChunks > 0) appendLine("chunk：" + job.nextChunkIndex + "/" + job.totalChunks)
-                job.serverRecordingId?.let { appendLine("服务器记录：" + it) }
-                job.errorMessage?.let { appendLine("提示：" + it) }
-            }
-        }.trim()
+        if (!::jobHistoryActions.isInitialized) return
+        val jobs = latestJobsByAudioName(TranscriptionJobRepository.list(this))
         refreshJobHistoryActions(jobs)
+    }
+
+    private fun latestJobsByAudioName(jobs: List<TranscriptionJob>): List<TranscriptionJob> {
+        val seen = linkedSetOf<String>()
+        val result = mutableListOf<TranscriptionJob>()
+        jobs.sortedByDescending { it.updatedAt }.forEach { job ->
+            val key = File(job.sourceName).name.trim().lowercase(Locale.ROOT)
+            if (seen.add(key)) result += job
+        }
+        return result.take(8)
+    }
+
+    private fun refreshResultPageIfVisible() {
+        val state = latestResultPageState ?: return
+        if (state.jobId == null) return
+        if (currentPage != LightAsrPage.RESULT) return
+        runCatching { showResultPage(state, scrollToTop = false) }
+            .onFailure { Log.w(TAG, "result page refresh failed", it) }
+    }
+
+    private fun refreshJobDetailPageIfVisible() {
+        val jobId = activeJobDetailId ?: return
+        if (currentPage != LightAsrPage.JOB_DETAIL) return
+        runCatching { showJobDetailPage(jobId, scrollToTop = false) }
+            .onFailure { Log.w(TAG, "job detail page refresh failed", it) }
     }
 
     private fun refreshJobHistoryActions(jobs: List<TranscriptionJob>) {
         if (!::jobHistoryActions.isInitialized) return
         jobHistoryActions.removeAllViews()
+        if (jobs.isEmpty()) {
+            jobHistoryActions.addView(TextView(this).apply {
+                text = "暂无分析任务"
+                textSize = 14f
+                setInfoBoxStyle(this, Color.parseColor("#F7FAF8"))
+            }, matchWrap())
+            return
+        }
         jobs.take(5).forEachIndexed { index, job ->
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-            row.addView(Button(this).apply {
-                text = "查看 " + (index + 1)
-                setOnClickListener { showJob(job.id) }
-            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            if (job.status in setOf(
-                    TranscriptionJobStatus.INTERRUPTED,
-                    TranscriptionJobStatus.FAILED,
-                    TranscriptionJobStatus.CANCELED,
-                ) && job.audioPath?.let { File(it).isFile } == true
-            ) {
-                row.addView(Button(this).apply {
-                    text = "继续 " + (index + 1)
-                    isEnabled = recognizer != null && activeTranscriptionJobId == null
-                    setOnClickListener { resumeJob(job.id) }
-                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            }
-            if (job.status in setOf(
-                    TranscriptionJobStatus.LOCAL_COMPLETED,
-                    TranscriptionJobStatus.UPLOAD_FAILED,
-                )
-            ) {
-                row.addView(Button(this).apply {
-                    text = "上传 " + (index + 1)
-                    isEnabled = activeTranscriptionJobId == null
-                    setOnClickListener { uploadJob(job.id) }
-                }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-            }
-            jobHistoryActions.addView(row, matchWrap())
+            val item = buildRecentJobItem(job)
+            jobHistoryActions.addView(item, if (index == 0) matchWrap() else childWrap(topMargin = 8))
         }
     }
 
-    private fun showJob(jobId: String) {
-        val job = TranscriptionJobRepository.get(this, jobId) ?: return
-        val transcript = job.transcriptPath?.let(::File)?.takeIf { it.isFile }
-            ?.readText(Charsets.UTF_8)?.take(200_000)
-        lastOutput = transcript ?: buildString {
-            appendLine("任务：" + job.sourceName)
-            appendLine("状态：" + jobStatusText(job.status))
-            appendLine("进度：" + job.progressPercent + "%")
-            appendLine("已处理 chunk：" + job.nextChunkIndex + "/" + job.totalChunks)
-            job.errorMessage?.let { appendLine("提示：" + it) }
-        }.trim()
-        resultView.text = lastOutput
-        copyButton.isEnabled = lastOutput.isNotBlank()
-        setStatus("正在查看任务：" + job.sourceName)
+    private fun buildRecentJobItem(job: TranscriptionJob): LinearLayout {
+        val canResume = job.status in setOf(
+            TranscriptionJobStatus.INTERRUPTED,
+            TranscriptionJobStatus.FAILED,
+            TranscriptionJobStatus.CANCELED,
+        ) && job.audioPath?.let { File(it).isFile } == true
+        val canUpload = job.status in setOf(
+            TranscriptionJobStatus.LOCAL_COMPLETED,
+            TranscriptionJobStatus.UPLOAD_FAILED,
+        )
+        val canViewResult = job.status in setOf(
+            TranscriptionJobStatus.LOCAL_COMPLETED,
+            TranscriptionJobStatus.UPLOADING,
+            TranscriptionJobStatus.UPLOADED,
+            TranscriptionJobStatus.UPLOAD_FAILED,
+        ) || job.transcriptPath?.let { File(it).isFile } == true
+        val buttons = mutableListOf<Button>()
+        if (canViewResult) {
+            buttons += Button(this).apply {
+                text = "查看结果"
+                styleSecondaryButton(this)
+                setOnClickListener { showJobDetailPage(job.id) }
+            }
+        }
+        if (canResume) {
+            buttons += Button(this).apply {
+                text = "继续"
+                styleSecondaryButton(this)
+                isEnabled = recognizer != null && activeTranscriptionJobId == null
+                setOnClickListener { resumeJob(job.id) }
+            }
+        }
+        if (canUpload) {
+            buttons += Button(this).apply {
+                text = if (job.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传" else "上传"
+                styleSecondaryButton(this)
+                isEnabled = activeTranscriptionJobId == null
+                setOnClickListener { uploadJob(job.id) }
+            }
+        }
+
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            background = roundedBackground(
+                fillColor = Color.parseColor("#F7FAF8"),
+                strokeColor = Color.parseColor("#E5EAF2"),
+                radiusDp = 8,
+            )
+            addView(TextView(this@MainActivity).apply {
+                text = job.sourceName
+                textSize = 15f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(Color.parseColor("#111827"))
+            }, matchWrap())
+            addView(TextView(this@MainActivity).apply {
+                text = jobStatusText(job.status) + " · " + job.progressPercent + "% · " +
+                    formatJobDuration(job.durationMs) + " · " + job.sourceType
+                textSize = 13f
+                setTextColor(Color.parseColor("#5D6675"))
+                setPadding(0, dp(4), 0, 0)
+            }, matchWrap())
+            if (job.totalChunks > 0) {
+                addView(TextView(this@MainActivity).apply {
+                    text = "进度：" + job.nextChunkIndex + "/" + job.totalChunks + " chunk"
+                    textSize = 13f
+                    setTextColor(Color.parseColor("#5D6675"))
+                    setPadding(0, dp(4), 0, 0)
+                }, matchWrap())
+            }
+            job.serverRecordingId?.let {
+                addView(TextView(this@MainActivity).apply {
+                    text = "服务器记录：$it"
+                    textSize = 13f
+                    setTextColor(Color.parseColor("#5D6675"))
+                    setPadding(0, dp(4), 0, 0)
+                }, matchWrap())
+            }
+            job.errorMessage?.let {
+                addView(TextView(this@MainActivity).apply {
+                    text = "提示：$it"
+                    textSize = 13f
+                    setTextColor(Color.parseColor("#8A4B0F"))
+                    setPadding(0, dp(4), 0, 0)
+                }, matchWrap())
+            }
+            if (buttons.isNotEmpty()) {
+                addView(buildButtonRow(*buttons.toTypedArray()), childWrap(topMargin = 8))
+            }
+        }
     }
 
     private fun resumeJob(jobId: String) {
@@ -1640,8 +2394,11 @@ Uri: ${file.uri}
         TranscriptionJobRepository.update(this, job.id) {
             it.copy(status = TranscriptionJobStatus.UPLOADING, progressPercent = 0, errorMessage = null)
         }
-        TranscriptionForegroundService.start(this, job.id, "LightASR 正在上传", job.sourceName)
+        runCatching { TranscriptionForegroundService.start(this, job.id, "LightASR 正在上传", job.sourceName) }
+            .onFailure { Log.w(TAG, "upload foreground service start failed", it) }
         refreshJobHistoryUi()
+        refreshResultPageIfVisible()
+        refreshJobDetailPageIfVisible()
         setStatus("正在上传 WAV 和 TXT...")
 
         thread(name = "upload-job-" + job.id.take(8)) {
@@ -1651,15 +2408,35 @@ Uri: ${file.uri}
                     audio, transcript, job.sourceName, job.sourceType,
                     recordingTimeIsoForSource(job.sourceName), job.durationMs, hash,
                     packageManager.getPackageInfo(packageName, 0).versionName ?: "unknown", deviceIdForUpload(),
-                ) { progress ->
+                    onStage = { stage ->
+                        TranscriptionJobRepository.update(this, job.id) {
+                            it.copy(status = TranscriptionJobStatus.UPLOADING, errorMessage = stage)
+                        }
+                        runOnUiThread {
+                            setStatus(stage + "：" + job.sourceName)
+                            refreshJobHistoryUi()
+                            refreshResultPageIfVisible()
+                            refreshJobDetailPageIfVisible()
+                        }
+                    },
+                    onProgress = { progress ->
                     if (progress >= lastProgress + 2) {
                         lastProgress = progress
                         TranscriptionJobRepository.update(this, job.id) { it.copy(progressPercent = progress) }
-                        TranscriptionForegroundService.progress(
-                            this, job.id, "LightASR 正在上传", job.sourceName + "  " + progress + "%", progress
-                        )
+                        runCatching {
+                            TranscriptionForegroundService.progress(
+                                this, job.id, "LightASR 正在上传", job.sourceName + "  " + progress + "%", progress
+                            )
+                        }.onFailure { Log.w(TAG, "upload foreground progress failed", it) }
+                        runOnUiThread {
+                            setStatus("正在上传 WAV 和 TXT... $progress%")
+                            refreshJobHistoryUi()
+                            refreshResultPageIfVisible()
+                            refreshJobDetailPageIfVisible()
+                        }
                     }
-                }
+                    },
+                )
                 TranscriptionJobRepository.update(this, job.id) {
                     it.copy(
                         status = TranscriptionJobStatus.UPLOADED,
@@ -1671,7 +2448,8 @@ Uri: ${file.uri}
                 runOnUiThread {
                     setStatus("上传完成：" + response.recordingId)
                     refreshJobHistoryUi()
-                    showJob(job.id)
+                    refreshResultPageIfVisible()
+                    refreshJobDetailPageIfVisible()
                 }
             } catch (t: Throwable) {
                 val message = t.message ?: t::class.java.simpleName
@@ -1681,10 +2459,13 @@ Uri: ${file.uri}
                 runOnUiThread {
                     setStatus("上传失败，可在任务记录中重试：" + message)
                     refreshJobHistoryUi()
+                    refreshResultPageIfVisible()
+                    refreshJobDetailPageIfVisible()
                 }
             } finally {
                 activeTranscriptionJobId = null
-                TranscriptionForegroundService.stop(this, job.id)
+                runCatching { TranscriptionForegroundService.stop(this, job.id) }
+                    .onFailure { Log.w(TAG, "upload foreground service stop failed", it) }
             }
         }
     }
@@ -2046,21 +2827,24 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                 "segmentMs=$CHUNKED_SEGMENT_MS, overlapMs=$CHUNKED_OVERLAP_MS"
         )
 
-        var segmentationMode = "chunked-${CHUNKED_SEGMENT_MS / 1000}s-speechgate-full-chunk-asr-overlap-${formatSeconds(CHUNKED_OVERLAP_MS)}s"
-        val ranges = try {
-            buildVadAdjustedSegmentRanges(
+        val segmentation = try {
+            buildNaturalUtteranceSegmentRanges(
                 wavFile = wavFile,
                 header = header,
-                chunkMs = CHUNKED_SEGMENT_MS,
-                overlapMs = CHUNKED_OVERLAP_MS,
-                vadSearchRadiusMs = VAD_BOUNDARY_SEARCH_RADIUS_MS,
-                vadMinSilenceMs = VAD_BOUNDARY_MIN_SILENCE_MS,
+                currentSpeechGate = currentSpeechGate,
             )
         } catch (t: Throwable) {
-            Log.w(TAG, "VAD 切点微调失败，回退固定分块: ${t.message ?: t::class.java.simpleName}")
-            segmentationMode = "chunked-${CHUNKED_SEGMENT_MS / 1000}s-speechgate-full-chunk-asr-overlap-${formatSeconds(CHUNKED_OVERLAP_MS)}s"
-            buildChunkedSegmentRanges(header.durationMs)
+            Log.w(TAG, "natural utterance VAD failed, fallback to fixed chunks: ${t.message ?: t::class.java.simpleName}")
+            val fallbackRanges = buildChunkedSegmentRanges(header.durationMs)
+            SegmentationResult(
+                mode = "fixed-${CHUNKED_SEGMENT_MS / 1000}s-fallback-overlap-${formatSeconds(CHUNKED_OVERLAP_MS)}s",
+                fallbackToFixedSegments = true,
+                rawSegmentCount = fallbackRanges.size,
+                mergedSegmentCount = fallbackRanges.size,
+                segments = fallbackRanges,
+            )
         }
+        val ranges = segmentation.segments
         if (jobId != null) {
             val checkpoint = TranscriptionCheckpointStore.load(this, jobId)
             TranscriptionJobRepository.update(this, jobId) {
@@ -2112,10 +2896,10 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             timestampedSentences = timestampedSentences,
             transcriptSegments = transcriptSegments,
             mergedText = mergedText,
-            segmentationMode = segmentationMode,
-            fallbackToFixedSegments = false,
-            rawSegmentCount = rawSegments.size,
-            mergedSegmentCount = segments.size,
+            segmentationMode = segmentation.mode,
+            fallbackToFixedSegments = segmentation.fallbackToFixedSegments,
+            rawSegmentCount = segmentation.rawSegmentCount,
+            mergedSegmentCount = segmentation.mergedSegmentCount,
             sampleRate = header.sampleRate,
             channels = header.channels,
             bitsPerSample = header.bitsPerSample,
@@ -2233,6 +3017,93 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             )
             return header
         }
+    }
+
+    private fun buildNaturalUtteranceSegmentRanges(
+        wavFile: File,
+        header: WavHeader,
+        currentSpeechGate: SpeechGate,
+    ): SegmentationResult {
+        if (header.durationMs <= 0L) {
+            return SegmentationResult(
+                mode = "natural-utterance-vad-empty",
+                fallbackToFixedSegments = false,
+                rawSegmentCount = 0,
+                mergedSegmentCount = 0,
+                segments = emptyList(),
+            )
+        }
+
+        val scanStepMs = (NATURAL_VAD_SCAN_WINDOW_MS - NATURAL_VAD_SCAN_OVERLAP_MS)
+            .coerceAtLeast(1L)
+        val rawSpeechSegments = mutableListOf<SpeechSegment>()
+        RandomAccessFile(wavFile, "r").use { input ->
+            var reusableBytes = ByteArray(0)
+            var scanStartMs = 0L
+            while (scanStartMs < header.durationMs) {
+                val scanEndMs = min(scanStartMs + NATURAL_VAD_SCAN_WINDOW_MS, header.durationMs)
+                val (nextReusableBytes, scanAudio) = readPcmChunkAsMonoFloat(
+                    input = input,
+                    header = header,
+                    range = SegmentRange(
+                        startMs = scanStartMs,
+                        endMs = scanEndMs,
+                        cutMode = "natural-vad-scan",
+                    ),
+                    reusableBytes = reusableBytes,
+                )
+                reusableBytes = nextReusableBytes
+                if (scanAudio.samples.isNotEmpty()) {
+                    val vadResult = currentSpeechGate.analyze(
+                        chunkStartMs = scanAudio.startMs,
+                        samples = scanAudio.samples,
+                        sampleRate = header.sampleRate,
+                    )
+                    rawSpeechSegments += vadResult.rawSpeechSegments
+                }
+                if (scanEndMs >= header.durationMs) break
+                scanStartMs += scanStepMs
+            }
+        }
+
+        val utterances = NaturalUtteranceSegmenter.assemble(
+            rawSegments = rawSpeechSegments,
+            audioDurationMs = header.durationMs,
+            config = NaturalUtteranceConfig(
+                mergeGapMs = NATURAL_UTTERANCE_MERGE_GAP_MS,
+                speechPaddingMs = NATURAL_UTTERANCE_PADDING_MS,
+                minSpeechMs = NATURAL_UTTERANCE_MIN_SPEECH_MS,
+            ),
+        )
+        val ranges = utterances.mapIndexed { index, utterance ->
+            SegmentRange(
+                startMs = utterance.startMs,
+                endMs = utterance.endMs,
+                index = index + 1,
+                cutMode = "natural-vad-utterance",
+                targetEndMs = utterance.endMs,
+                adjustedEndMs = utterance.endMs,
+            )
+        }
+
+        Log.i(
+            TAG,
+            "natural utterance ranges built raw=${rawSpeechSegments.size}, " +
+                "utterances=${ranges.size}, scanWindowMs=$NATURAL_VAD_SCAN_WINDOW_MS, " +
+                "scanOverlapMs=$NATURAL_VAD_SCAN_OVERLAP_MS, " +
+                "mergeGapMs=$NATURAL_UTTERANCE_MERGE_GAP_MS, paddingMs=$NATURAL_UTTERANCE_PADDING_MS"
+        )
+        ranges.forEach { range ->
+            Log.i(TAG, "natural utterance index=${range.index} startMs=${range.startMs} endMs=${range.endMs}")
+        }
+
+        return SegmentationResult(
+            mode = "natural-utterance-vad-gap-${NATURAL_UTTERANCE_MERGE_GAP_MS}ms-pad-${NATURAL_UTTERANCE_PADDING_MS}ms",
+            fallbackToFixedSegments = false,
+            rawSegmentCount = rawSpeechSegments.size,
+            mergedSegmentCount = ranges.size,
+            segments = ranges,
+        )
     }
 
     private fun buildVadAdjustedSegmentRanges(
@@ -2545,7 +3416,7 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                     " vadSpeechMs=" + vadResult.totalSpeechMs +
                     " usedHeap=" + currentUsedHeapBytes())
 
-                val segmentText = recognizeSamples(
+                val rawSegmentText = recognizeSamples(
                     currentRecognizer = currentRecognizer,
                     samples = chunkAudio.samples,
                     sampleRate = header.sampleRate,
@@ -2553,6 +3424,7 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                     chunkDurationMs = chunkDurationMs,
                     logNativeTimestampDetail = position == resumeAt,
                 )
+                val segmentText = formatNaturalUtteranceText(rawSegmentText)
                 val segment = RecognitionSegment(
                     index = segments.size + 1,
                     startMs = chunkAudio.startMs,
@@ -3186,9 +4058,21 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
         chunkDurationMs: Long? = null,
         logNativeTimestampDetail: Boolean = false,
     ): String {
+        val normalization = SafeAudioNormalizer.normalize(samples)
+        Log.i(
+            TAG,
+            "audio normalization chunk=${chunkIndex ?: -1}, " +
+                "inputRmsDb=${"%.2f".format(Locale.US, normalization.inputRmsDb)}, " +
+                "outputRmsDb=${"%.2f".format(Locale.US, normalization.outputRmsDb)}, " +
+                "inputPeak=${"%.4f".format(Locale.US, normalization.inputPeak)}, " +
+                "outputPeak=${"%.4f".format(Locale.US, normalization.outputPeak)}, " +
+                "gain=${"%.3f".format(Locale.US, normalization.gain)}, " +
+                "dc=${"%.6f".format(Locale.US, normalization.removedDcOffset)}, " +
+                "clipped=${normalization.clippedSamples}, applied=${normalization.applied}"
+        )
         val stream = currentRecognizer.createStream()
         try {
-            stream.acceptWaveform(samples, sampleRate)
+            stream.acceptWaveform(normalization.samples, sampleRate)
             currentRecognizer.decode(stream)
             val result = currentRecognizer.getResult(stream)
             logNativeTimestampProbe(
@@ -3200,7 +4084,19 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                 durations = result.durations,
                 logDetail = logNativeTimestampDetail,
             )
-            return result.text.trim()
+            val rawText = result.text.trim()
+            val correction = localSemanticCorrector.correct(rawText)
+            if (correction.changed) {
+                val rules = correction.appliedRules.joinToString(",") {
+                    "${it.category}:${it.observed}->${it.canonical}(${it.occurrences})"
+                }
+                Log.i(
+                    TAG,
+                    "local semantic correction chunk=${chunkIndex ?: -1}, " +
+                        "rules=$rules, raw=$rawText, corrected=${correction.correctedText}"
+                )
+            }
+            return correction.correctedText
         } finally {
             stream.release()
         }
@@ -3319,6 +4215,11 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
 
         for (segment in segments) {
             if (segment.text.isBlank() || segment.endUs <= segment.startUs) continue
+            val timestampSource = if (segment.cutMode.startsWith("natural-vad-utterance")) {
+                TimestampSource.VAD_BOUNDARY
+            } else {
+                TimestampSource.ESTIMATED
+            }
 
             val sentenceTexts = splitTranscriptSentences(segment.text)
                 .filter { it.isNotBlank() }
@@ -3329,7 +4230,7 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                     relativeStartUs = segment.startUs,
                     relativeEndUs = segment.endUs,
                     text = sentenceTexts.first(),
-                    timestampSource = TimestampSource.ESTIMATED,
+                    timestampSource = timestampSource,
                     recordingTimeContext = recordingTimeContext,
                 )
                 continue
@@ -3354,7 +4255,7 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                         relativeStartUs = cursorUs,
                         relativeEndUs = endUs,
                         text = sentenceText,
-                        timestampSource = TimestampSource.ESTIMATED,
+                        timestampSource = timestampSource,
                         recordingTimeContext = recordingTimeContext,
                     )
                 }
@@ -3362,7 +4263,7 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             }
         }
 
-        return transcriptSegments
+        return dedupTimestampedTranscriptSegments(transcriptSegments)
     }
 
     private fun buildTranscriptSegment(
@@ -3383,13 +4284,81 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
         )
     }
 
+    private fun dedupTimestampedTranscriptSegments(
+        segments: List<TimestampedTranscriptSegment>,
+    ): List<TimestampedTranscriptSegment> {
+        if (segments.isEmpty()) return emptyList()
+        val result = mutableListOf<TimestampedTranscriptSegment>()
+        var removed = 0
+        var dropped = 0
+
+        for (segment in segments) {
+            val rawText = segment.text.trim()
+            if (rawText.isBlank()) continue
+
+            val currentNorm = normalizeTranscriptText(rawText)
+            val previous = result.lastOrNull()
+            val overlapsPrevious = previous != null &&
+                segment.relativeStartUs < previous.relativeEndUs
+            if (previous != null && overlapsPrevious) {
+                val previousNorm = normalizeTranscriptText(previous.text)
+                when {
+                    currentNorm.isEmpty() -> continue
+                    previousNorm == currentNorm -> {
+                        dropped += 1
+                        Log.i(TAG, "dedup transcript row dropped exact text=$rawText")
+                        continue
+                    }
+                    previousNorm.contains(currentNorm) && currentNorm.length >= DEDUP_MIN_OVERLAP_CHARS -> {
+                        dropped += 1
+                        Log.i(TAG, "dedup transcript row dropped contained text=$rawText")
+                        continue
+                    }
+                    currentNorm.contains(previousNorm) &&
+                        previousNorm.length >= DEDUP_MIN_OVERLAP_CHARS &&
+                        previousNorm.length.toDouble() / currentNorm.length.toDouble() >= 0.55 -> {
+                        result[result.lastIndex] = segment.copy(
+                            relativeStartUs = previous.relativeStartUs,
+                            absoluteStartEpochMs = previous.absoluteStartEpochMs,
+                        )
+                        removed += previous.text.length
+                        Log.i(TAG, "dedup transcript row replaced previous with longer text=$rawText")
+                        continue
+                    }
+                }
+            }
+
+            val cutIndex = if (previous != null && overlapsPrevious) {
+                findNormalizedPrefixOverlapCutIndex(
+                    left = previous.text,
+                    right = rawText,
+                    maxCheck = DEDUP_MAX_CHECK_CHARS,
+                ).coerceIn(0, rawText.length)
+            } else 0
+            val cleanedText = trimLeadingDedupSeparators(rawText.substring(cutIndex))
+            removed += rawText.length - cleanedText.length
+            if (cleanedText.isBlank()) {
+                dropped += 1
+                Log.i(TAG, "dedup transcript row dropped overlap-only text=$rawText")
+                continue
+            }
+
+            result += segment.copy(text = cleanedText)
+        }
+
+        Log.i(
+            TAG,
+            "dedup transcript rows raw=${segments.size}, kept=${result.size}, dropped=$dropped, removedChars=$removed"
+        )
+        return result
+    }
+
     private fun dedupRecognitionSegments(
         segments: List<RecognitionSegment>,
     ): List<RecognitionSegment> {
         if (segments.isEmpty()) return emptyList()
 
         val result = mutableListOf<RecognitionSegment>()
-        val accumulatedText = StringBuilder()
         var removedChars = 0
         var droppedSegments = 0
 
@@ -3401,11 +4370,11 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             }
 
             val previousSegment = result.lastOrNull()
-            val canDedupAgainstPrevious = previousSegment != null &&
-                segment.startMs <= previousSegment.endMs + CHUNKED_OVERLAP_MS + 500L
-            val cutIndex = if (canDedupAgainstPrevious) {
+            val overlapsPrevious = previousSegment != null &&
+                segment.startUs < previousSegment.endUs
+            val cutIndex = if (previousSegment != null && overlapsPrevious) {
                 findNormalizedPrefixOverlapCutIndex(
-                    left = accumulatedText.toString(),
+                    left = previousSegment.text,
                     right = rawText,
                     maxCheck = DEDUP_MAX_CHECK_CHARS,
                 ).coerceIn(0, rawText.length)
@@ -3414,6 +4383,14 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             }
             val cleanedText = trimLeadingDedupSeparators(rawText.substring(cutIndex))
             removedChars += rawText.length - cleanedText.length
+            if (cutIndex > 0) {
+                Log.i(
+                    TAG,
+                    "dedup segment overlap index=${segment.index}, " +
+                        "gapMs=${segment.startMs - (previousSegment?.endMs ?: segment.startMs)}, " +
+                        "cutChars=$cutIndex"
+                )
+            }
 
             if (cleanedText.isBlank()) {
                 droppedSegments += 1
@@ -3422,10 +4399,6 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             }
 
             result += segment.copy(text = cleanedText)
-            accumulatedText.append(cleanedText)
-            if (accumulatedText.length > DEDUP_ACCUMULATED_TAIL_CHARS) {
-                accumulatedText.delete(0, accumulatedText.length - DEDUP_ACCUMULATED_TAIL_CHARS)
-            }
         }
 
         Log.i(
@@ -3468,7 +4441,11 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
                         endSec = endSec,
                         text = sentenceText,
                         sourceSegmentIndex = segment.index,
-                        timeMode = "estimated-from-chunk",
+                        timeMode = if (segment.cutMode.startsWith("natural-vad-utterance")) {
+                            "vad-boundary"
+                        } else {
+                            "estimated-from-chunk"
+                        },
                     )
                 }
                 cursorSec = endSec
@@ -3503,6 +4480,88 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
         }
 
         return sentences.ifEmpty { listOf(trimmed) }
+            .filter { it.isNotBlank() }
+    }
+
+    private fun formatNaturalUtteranceText(text: String): String {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return trimmed
+        if (trimmed.last() in setOf('。', '！', '？', '；', '.', '!', '?', ';')) return trimmed
+
+        val normalized = normalizeTranscriptText(trimmed)
+        val questionPrefixes = listOf(
+            "要不要", "有没有", "是不是", "多少", "几", "哪", "怎么", "为什么",
+            "能不能", "可不可以", "是否", "谁", "什么",
+        )
+        return when {
+            normalized.endsWith("吗") || normalized.endsWith("么") || normalized.endsWith("呢") ||
+                questionPrefixes.any { normalized.startsWith(it) } -> "$trimmed？"
+            normalized.endsWith("啊") || normalized.endsWith("呀") || normalized.endsWith("啦") ||
+                normalized.endsWith("喽") -> "$trimmed！"
+            else -> "$trimmed。"
+        }
+    }
+
+    private fun splitLongTranscriptSentence(sentence: String): List<String> {
+        val trimmed = sentence.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        if (effectiveNormalizedTextLength(trimmed) <= TRANSCRIPT_MAX_SENTENCE_NORM_CHARS) {
+            return listOf(trimmed)
+        }
+
+        val softBreaks = setOf('，', ',', '、', '：', ':')
+        val clauses = mutableListOf<String>()
+        val current = StringBuilder()
+        for (char in trimmed) {
+            current.append(char)
+            if (char in softBreaks) {
+                val clause = current.toString().trim()
+                if (clause.isNotEmpty()) clauses += clause
+                current.clear()
+            }
+        }
+        val tail = current.toString().trim()
+        if (tail.isNotEmpty()) clauses += tail
+
+        val packed = mutableListOf<String>()
+        val buffer = StringBuilder()
+        for (clause in clauses.ifEmpty { listOf(trimmed) }) {
+            val candidate = (buffer.toString() + clause).trim()
+            if (buffer.isNotEmpty() &&
+                effectiveNormalizedTextLength(candidate) > TRANSCRIPT_MAX_SENTENCE_NORM_CHARS
+            ) {
+                packed += buffer.toString().trim()
+                buffer.clear()
+            }
+            if (effectiveNormalizedTextLength(clause) > TRANSCRIPT_MAX_SENTENCE_NORM_CHARS) {
+                if (buffer.isNotEmpty()) {
+                    packed += buffer.toString().trim()
+                    buffer.clear()
+                }
+                packed += splitByNormalizedLength(clause, TRANSCRIPT_MAX_SENTENCE_NORM_CHARS)
+            } else {
+                buffer.append(clause)
+            }
+        }
+        if (buffer.isNotEmpty()) packed += buffer.toString().trim()
+        return packed.filter { it.isNotBlank() }
+    }
+
+    private fun splitByNormalizedLength(text: String, maxNormLength: Int): List<String> {
+        val result = mutableListOf<String>()
+        var start = 0
+        while (start < text.length) {
+            var normCount = 0
+            var end = start
+            while (end < text.length && normCount < maxNormLength) {
+                if (text[end].isLetterOrDigit()) normCount += 1
+                end += 1
+            }
+            if (end <= start) end = min(text.length, start + maxNormLength)
+            result += text.substring(start, end).trim()
+            start = end
+        }
+        return result.filter { it.isNotBlank() }
     }
 
     private fun effectiveNormalizedTextLength(text: String): Int {
@@ -3530,9 +4589,10 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
         val fuzzyMinOverlap = DEDUP_FUZZY_MIN_OVERLAP_CHARS
         val fuzzyThreshold = DEDUP_FUZZY_THRESHOLD
 
+        val leftNearTail = leftNorm.takeLast(min(leftNorm.length, max(80, rightNorm.length * 2)))
         if (rightNorm.length >= minOverlap &&
             rightNorm.length <= maxCheck &&
-            leftNorm.contains(rightNorm)
+            (leftNearTail.endsWith(rightNorm) || (rightNorm.length >= 12 && leftNearTail.contains(rightNorm)))
         ) {
             return right.length
         }
@@ -3547,12 +4607,12 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
             if (prefixLength > leftNorm.length) continue
 
             val leftSuffix = leftNorm.takeLast(prefixLength)
-            val leftNearTail = leftNorm.takeLast(min(leftNorm.length, max(80, prefixLength * 2)))
+            val prefixNearTail = leftNorm.takeLast(min(leftNorm.length, max(80, prefixLength * 2)))
             val isExactOverlap = leftSuffix == prefixNorm
             val isFuzzyOverlap = prefixLength >= fuzzyMinOverlap &&
                 normalizedSimilarity(leftSuffix, prefixNorm) >= fuzzyThreshold
             val isContainedNearTail = prefixLength >= 12 &&
-                leftNearTail.contains(prefixNorm)
+                prefixNearTail.contains(prefixNorm)
 
             if (isExactOverlap || isFuzzyOverlap || isContainedNearTail) {
                 bestCutIndex = rawEnd
@@ -3649,6 +4709,11 @@ margin：${result.scoreMargin?.let { "%.3f".format(Locale.US, it) } ?: "无"}
 
             val previous = result.lastOrNull()
             if (previous == null) {
+                result += sentence
+                continue
+            }
+
+            if (sentence.startSec >= previous.endSec) {
                 result += sentence
                 continue
             }
@@ -3780,7 +4845,6 @@ $txtStatus
                 segmentationMode = output.segmentationMode,
                 stats = output.stats,
                 transcriptSegments = output.transcriptSegments,
-                mergedText = if (output.stats.hasAnySpeech) output.mergedText else "",
             )
         }
 
@@ -3888,6 +4952,147 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
         return formatTxtTimestamp((seconds * 1000.0).roundToLong())
     }
 
+    private fun exportTxtToUserLocation(file: File) {
+        if (!isUsableTxtFile(file)) {
+            showTxtOperationError("无法保存", "TXT 文件不存在或为空，请重新完成一次识别。")
+            return
+        }
+        pendingTxtExportPath = file.absolutePath
+        txtDocumentCreator.launch(file.name)
+    }
+
+    private fun finishTxtExport(destinationUri: Uri?) {
+        val sourcePath = pendingTxtExportPath
+        pendingTxtExportPath = null
+        if (destinationUri == null) {
+            Toast.makeText(this, "已取消保存", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val sourceFile = sourcePath?.let(::File)
+        if (sourceFile == null || !isUsableTxtFile(sourceFile)) {
+            showTxtOperationError("保存失败", "找不到待保存的 TXT 文件，请返回任务记录后重试。")
+            return
+        }
+
+        thread(name = "txt-export") {
+            val result = runCatching {
+                val output = contentResolver.openOutputStream(destinationUri, "w")
+                    ?: error("系统未提供可写入的目标文件")
+                sourceFile.inputStream().use { input ->
+                    output.use { target -> input.copyTo(target) }
+                }
+            }
+            runOnUiThread {
+                result.onSuccess {
+                    setStatus("TXT 已保存到您选择的位置")
+                    showTxtSavedDialog(destinationUri)
+                }.onFailure { error ->
+                    Log.e(TAG, "TXT export failed uri=$destinationUri", error)
+                    showTxtOperationError("保存失败", error.message ?: error::class.java.simpleName)
+                }
+            }
+        }
+    }
+
+    private fun showTxtSavedDialog(uri: Uri) {
+        AlertDialog.Builder(this)
+            .setTitle("TXT 已保存")
+            .setMessage("文件已经保存到您选择的位置，可在手机文件管理器中找到。")
+            .setPositiveButton("打开查看") { _, _ -> openTxtUri(uri) }
+            .setNegativeButton("完成", null)
+            .show()
+    }
+
+    private fun showTxtFile(file: File) {
+        if (!isUsableTxtFile(file)) {
+            showTxtOperationError("无法查看", "TXT 文件不存在或为空，请重新完成一次识别。")
+            return
+        }
+        thread(name = "txt-preview") {
+            val result = runCatching { file.readText(Charsets.UTF_8) }
+            runOnUiThread {
+                result.onSuccess { content -> showTxtContentDialog(file.name, content) }
+                    .onFailure { error ->
+                        Log.e(TAG, "TXT preview failed path=${file.absolutePath}", error)
+                        showTxtOperationError("读取失败", error.message ?: error::class.java.simpleName)
+                    }
+            }
+        }
+    }
+
+    private fun showTxtContentDialog(fileName: String, content: String) {
+        val contentView = TextView(this).apply {
+            text = content
+            textSize = 14f
+            setTextIsSelectable(true)
+            setPadding(dp(18), dp(12), dp(18), dp(12))
+        }
+        val scrollView = ScrollView(this).apply {
+            addView(contentView, matchWrap())
+        }
+        AlertDialog.Builder(this)
+            .setTitle(fileName)
+            .setView(scrollView)
+            .setPositiveButton("复制全文") { _, _ ->
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText(fileName, content))
+                Toast.makeText(this, "全文已复制", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("关闭", null)
+            .show()
+    }
+
+    private fun shareTxtFile(file: File) {
+        if (!isUsableTxtFile(file)) {
+            showTxtOperationError("无法分享", "TXT 文件不存在或为空，请重新完成一次识别。")
+            return
+        }
+        runCatching {
+            val contentUri = FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                file,
+            )
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_SUBJECT, file.name)
+                putExtra(Intent.EXTRA_STREAM, contentUri)
+                clipData = ClipData.newRawUri(file.name, contentUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(shareIntent, "分享识别结果"))
+        }.onFailure { error ->
+            Log.e(TAG, "TXT share failed path=${file.absolutePath}", error)
+            showTxtOperationError("分享失败", error.message ?: "没有可用于分享 TXT 的应用")
+        }
+    }
+
+    private fun openTxtUri(uri: Uri) {
+        runCatching {
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "text/plain")
+                clipData = ClipData.newRawUri("TXT", uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(viewIntent)
+        }.onFailure { error ->
+            Log.w(TAG, "No app can open exported TXT uri=$uri", error)
+            showTxtOperationError("无法打开", "TXT 已保存，但手机中没有可打开纯文本文件的应用。")
+        }
+    }
+
+    private fun showTxtOperationError(title: String, message: String) {
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setMessage(message)
+            .setPositiveButton("知道了", null)
+            .show()
+    }
+
+    private fun isUsableTxtFile(file: File): Boolean {
+        return file.isFile && file.length() > 0L
+    }
+
     private fun saveTimestampedTxt(
         sourceFileName: String?,
         content: String,
@@ -3941,6 +5146,170 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
+    private fun buildCard(): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(16), dp(16), dp(16))
+            background = roundedBackground(
+                fillColor = Color.WHITE,
+                strokeColor = Color.parseColor("#E5EAF2"),
+                radiusDp = 12,
+            )
+        }
+    }
+
+    private fun buildButtonRow(vararg buttons: Button): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            buttons.forEachIndexed { index, button ->
+                detachFromParent(button)
+                addView(
+                    button,
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                        if (index > 0) setMargins(dp(8), 0, 0, 0)
+                    },
+                )
+            }
+        }
+    }
+
+    private fun sectionTitle(text: String): TextView {
+        return TextView(this).apply {
+            this.text = text
+            textSize = 20f
+            typeface = Typeface.DEFAULT_BOLD
+            setTextColor(Color.parseColor("#111827"))
+        }
+    }
+
+    private fun buildStatCell(title: String, value: String, colorHex: String): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = title
+                    textSize = 13f
+                    gravity = Gravity.CENTER
+                    setTextColor(Color.parseColor("#111827"))
+                },
+                matchWrap(),
+            )
+            addView(
+                TextView(this@MainActivity).apply {
+                    text = value
+                    textSize = 18f
+                    gravity = Gravity.CENTER
+                    typeface = Typeface.DEFAULT_BOLD
+                    setTextColor(Color.parseColor(colorHex))
+                    setPadding(0, dp(6), 0, 0)
+                },
+                matchWrap(),
+            )
+        }
+    }
+
+    private fun statCellParams() = LinearLayout.LayoutParams(
+        0,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+        1f,
+    )
+
+    private fun buildTranscriptPreview(output: RecognitionOutput): String {
+        if (!output.stats.hasAnySpeech) return NO_SPEECH_MESSAGE
+        val lines = output.transcriptSegments
+            .take(5)
+            .map { segment ->
+                "[${formatTxtTimestamp(segment.relativeStartUs / 1_000L)}] ${segment.text}"
+            }
+        if (lines.isNotEmpty()) return lines.joinToString("\n\n")
+        return output.mergedText
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(5)
+            .joinToString("\n\n")
+            .ifBlank { output.text.take(500) }
+    }
+
+    private fun formatBytes(bytes: Long?): String {
+        val value = bytes ?: return "大小未知"
+        if (value < 1024L) return "$value B"
+        val units = arrayOf("KB", "MB", "GB")
+        var amount = value.toDouble() / 1024.0
+        var index = 0
+        while (amount >= 1024.0 && index < units.lastIndex) {
+            amount /= 1024.0
+            index++
+        }
+        return String.format(Locale.US, "%.2f %s", amount, units[index])
+    }
+
+    private fun stylePrimaryButton(button: Button) {
+        button.setTextColor(Color.WHITE)
+        button.textSize = 15f
+        button.typeface = Typeface.DEFAULT_BOLD
+        button.background = roundedBackground(
+            fillColor = Color.parseColor("#1263EA"),
+            strokeColor = Color.parseColor("#1263EA"),
+            radiusDp = 8,
+        )
+    }
+
+    private fun styleSecondaryButton(button: Button) {
+        button.setTextColor(Color.parseColor("#1263EA"))
+        button.textSize = 15f
+        button.background = roundedBackground(
+            fillColor = Color.WHITE,
+            strokeColor = Color.parseColor("#1263EA"),
+            radiusDp = 8,
+        )
+    }
+
+    private fun setInputStyle(input: EditText) {
+        input.textSize = 14f
+        input.setPadding(dp(12), dp(8), dp(12), dp(8))
+        input.background = roundedBackground(
+            fillColor = Color.parseColor("#F8FAFD"),
+            strokeColor = Color.parseColor("#D9E2F0"),
+            radiusDp = 8,
+        )
+    }
+
+    private fun setInfoBoxStyle(
+        view: TextView,
+        fillColor: Int,
+        strokeColor: Int = Color.parseColor("#E5EAF2"),
+    ) {
+        view.setTextColor(Color.parseColor("#374151"))
+        view.setPadding(dp(12), dp(10), dp(12), dp(10))
+        view.background = roundedBackground(
+            fillColor = fillColor,
+            strokeColor = strokeColor,
+            radiusDp = 8,
+        )
+    }
+
+    private fun roundedBackground(fillColor: Int, strokeColor: Int, radiusDp: Int): GradientDrawable {
+        return GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            setColor(fillColor)
+            cornerRadius = dp(radiusDp).toFloat()
+            if (strokeColor != Color.TRANSPARENT) {
+                setStroke(dp(1), strokeColor)
+            }
+        }
+    }
+
+    private fun detachFromParent(view: View) {
+        (view.parent as? ViewGroup)?.removeView(view)
+    }
+
+    private fun formatJobDuration(durationMs: Long?): String {
+        val value = durationMs ?: 0L
+        return if (value > 0L) formatTxtTimestamp(value) else "--:--"
+    }
+
     private fun matchWrap() = LinearLayout.LayoutParams(
         LinearLayout.LayoutParams.MATCH_PARENT,
         LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -3957,6 +5326,13 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
         LinearLayout.LayoutParams.WRAP_CONTENT,
         LinearLayout.LayoutParams.WRAP_CONTENT,
     )
+
+    private fun childWrap(topMargin: Int = 10) = LinearLayout.LayoutParams(
+        LinearLayout.LayoutParams.MATCH_PARENT,
+        LinearLayout.LayoutParams.WRAP_CONTENT,
+    ).apply {
+        setMargins(0, dp(topMargin), 0, 0)
+    }
 
     override fun onStart() {
         super.onStart()
@@ -3988,6 +5364,7 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
     }
 
     override fun onDestroy() {
+        unregisterPlatformBackCallback()
         if (activeTranscriptionJobId == null) {
             recognizer?.release()
             recognizer = null

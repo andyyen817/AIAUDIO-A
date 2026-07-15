@@ -61,6 +61,7 @@ venv/
 
 # Downloaded archives / extracted setup cache
 downloads/
+.model-downloads/
 
 # Duplicate native-library cache for the local sherpa_onnx module.
 # Runtime libraries required by the APK are kept under app/src/main/jniLibs/.

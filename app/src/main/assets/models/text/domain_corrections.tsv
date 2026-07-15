@@ -1,0 +1,19 @@
+# 误识别文本<TAB>标准文本<TAB>分类
+如西何	泸溪河	brand
+如溪河	泸溪河	brand
+芦溪河	泸溪河	brand
+鲁西河	泸溪河	brand
+泸西河	泸溪河	brand
+鹿溪河	泸溪河	brand
+陆西河	泸溪河	brand
+泸溪和	泸溪河	brand
+二维马	二维码	checkout
+二维吗	二维码	checkout
+二为码	二维码	checkout
+二微码	二维码	checkout
+支付保	支付宝	checkout
+社口	社恐	common
+转升本	专升本	common
+专生本	专升本	common
+转生本	专升本	common
+生本是其次	升本是其次	common
