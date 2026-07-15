@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Optional
 
 try:
+    import oss2
+except ImportError:  # OSS is optional for local file-only tests.
+    oss2 = None
+
+try:
     import psycopg
 except ImportError:  # Local file-only tests do not require PostgreSQL.
     psycopg = None
@@ -34,6 +39,8 @@ DEFAULT_MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
 app = FastAPI(title="LightASR Upload Receiver", version="0.2.0")
 database_status = "disabled"
 database_error: Optional[str] = None
+oss_status = "disabled"
+oss_error: Optional[str] = None
 
 
 def incoming_root() -> Path:
@@ -53,6 +60,66 @@ def database_url() -> Optional[str]:
 
 def database_required() -> bool:
     return os.getenv("DATABASE_REQUIRED", "false").lower() in {"1", "true", "yes"}
+
+
+def oss_enabled() -> bool:
+    return bool(os.getenv("ALIYUN_OSS_BUCKET", "").strip())
+
+
+def oss_required() -> bool:
+    return os.getenv("OSS_REQUIRED", "false").lower() in {"1", "true", "yes"}
+
+
+def oss_prefix() -> str:
+    return os.getenv("ALIYUN_OSS_PREFIX", "lightasr").strip().strip("/")
+
+
+def oss_bucket():
+    if not oss_enabled():
+        return None
+    if oss2 is None:
+        raise RuntimeError("ALIYUN_OSS_BUCKET is configured but oss2 is not installed")
+    endpoint = os.getenv("ALIYUN_OSS_ENDPOINT", "").strip()
+    bucket_name = os.getenv("ALIYUN_OSS_BUCKET", "").strip()
+    access_key_id = os.getenv("ALIYUN_OSS_ACCESS_KEY_ID", "").strip()
+    access_key_secret = os.getenv("ALIYUN_OSS_ACCESS_KEY_SECRET", "").strip()
+    if not endpoint or not bucket_name or not access_key_id or not access_key_secret:
+        raise RuntimeError(
+            "ALIYUN_OSS_ENDPOINT, ALIYUN_OSS_BUCKET, "
+            "ALIYUN_OSS_ACCESS_KEY_ID, and ALIYUN_OSS_ACCESS_KEY_SECRET are required"
+        )
+    auth = oss2.Auth(access_key_id, access_key_secret)
+    return oss2.Bucket(auth, endpoint, bucket_name)
+
+
+def build_oss_key(*parts: str) -> str:
+    clean_parts = [part.strip("/").replace("\\", "/") for part in parts if part.strip("/")]
+    prefix = oss_prefix()
+    if prefix:
+        clean_parts.insert(0, prefix)
+    return "/".join(clean_parts)
+
+
+def init_oss() -> None:
+    global oss_status, oss_error
+    if not oss_enabled():
+        oss_status = "disabled"
+        oss_error = None
+        logger.info("oss disabled: ALIYUN_OSS_BUCKET is not configured")
+        return
+    try:
+        bucket = oss_bucket()
+        assert bucket is not None
+        bucket.get_bucket_info()
+        oss_status = "ready"
+        oss_error = None
+        logger.info("oss ready bucket=%s prefix=%s", os.getenv("ALIYUN_OSS_BUCKET"), oss_prefix())
+    except Exception as exc:
+        oss_status = "error"
+        oss_error = str(exc)
+        logger.exception("oss initialization failed: %s", exc)
+        if oss_required():
+            raise
 
 
 def max_audio_bytes() -> int:
@@ -224,6 +291,8 @@ def upsert_recording(
     app_version: Optional[str],
     audio_path: Path,
     transcript_path: Path,
+    audio_size_bytes: int,
+    transcript_size_bytes: int,
 ) -> None:
     url = database_url()
     if not url:
@@ -256,10 +325,21 @@ def upsert_recording(
                 (
                     recording_id, device_id, audio_sha256, original_name, source,
                     recording_time, duration_ms, app_version, str(audio_path), str(transcript_path),
-                    audio_path.stat().st_size, transcript_path.stat().st_size,
+                    audio_size_bytes, transcript_size_bytes,
                 ),
             )
         conn.commit()
+
+
+def upload_file_to_oss(local_path: Path, oss_key: str, content_type: str) -> None:
+    if not oss_enabled():
+        return
+    if oss_status != "ready":
+        raise RuntimeError(f"oss is not ready: {oss_error or oss_status}")
+    bucket = oss_bucket()
+    assert bucket is not None
+    headers = {"Content-Type": content_type}
+    bucket.put_object_from_file(oss_key, str(local_path), headers=headers)
 
 
 def recording_id_for(device_id: str, audio_sha256: str) -> str:
@@ -317,9 +397,10 @@ def on_startup() -> None:
     incoming_root().mkdir(parents=True, exist_ok=True)
     analyzed_recordings_root().mkdir(parents=True, exist_ok=True)
     init_database()
+    init_oss()
     logger.info(
-        "LightASR upload receiver started incomingDir=%s recordingsDir=%s",
-        incoming_root(), analyzed_recordings_root(),
+        "LightASR upload receiver started incomingDir=%s recordingsDir=%s oss=%s",
+        incoming_root(), analyzed_recordings_root(), oss_status,
     )
 
 
@@ -343,9 +424,14 @@ def health() -> str:
 def ready() -> JSONResponse:
     ready_state = database_status != "error" and (
         not database_required() or database_status == "ready"
-    )
+    ) and oss_status != "error" and (not oss_required() or oss_status == "ready")
     return JSONResponse(
-        {"ready": ready_state, "database": database_status, "storage": str(analyzed_recordings_root())},
+        {
+            "ready": ready_state,
+            "database": database_status,
+            "oss": oss_status,
+            "storage": str(analyzed_recordings_root()),
+        },
         status_code=200 if ready_state else 503,
     )
 
@@ -420,6 +506,15 @@ async def upload_analyzed_recording(
     target_dir = (root / safe_device_id / recording_id).resolve()
     audio_path = (target_dir / safe_name).resolve()
     transcript_path = (target_dir / f"{Path(safe_name).stem}.txt").resolve()
+    audio_oss_key = build_oss_key("recordings", safe_device_id, recording_id, safe_name)
+    transcript_oss_key = build_oss_key(
+        "recordings", safe_device_id, recording_id, f"{Path(safe_name).stem}.txt",
+    )
+    bucket_name = os.getenv("ALIYUN_OSS_BUCKET", "").strip()
+    audio_storage_path = Path(f"oss://{bucket_name}/{audio_oss_key}") if oss_enabled() else audio_path
+    transcript_storage_path = (
+        Path(f"oss://{bucket_name}/{transcript_oss_key}") if oss_enabled() else transcript_path
+    )
     audio_part = Path(f"{audio_path}.part")
     transcript_part = Path(f"{transcript_path}.part")
     for path in (target_dir, audio_path, transcript_path, audio_part, transcript_part):
@@ -431,7 +526,9 @@ async def upload_analyzed_recording(
             recording_id=recording_id, device_id=safe_device_id, audio_sha256=expected_sha256,
             original_name=safe_name, source=safe_source, recording_time=parsed_recording_time,
             duration_ms=duration_ms, app_version=app_version,
-            audio_path=audio_path, transcript_path=transcript_path,
+            audio_path=audio_storage_path, transcript_path=transcript_storage_path,
+            audio_size_bytes=audio_path.stat().st_size,
+            transcript_size_bytes=transcript_path.stat().st_size,
         )
         logger.info("recording duplicate ignored recordingId=%s", recording_id)
         return {"recording_id": recording_id, "upload_status": "uploaded"}
@@ -453,15 +550,19 @@ async def upload_analyzed_recording(
         transcript_part.read_text(encoding="utf-8")
         audio_part.replace(audio_path)
         transcript_part.replace(transcript_path)
+        upload_file_to_oss(audio_path, audio_oss_key, "audio/wav")
+        upload_file_to_oss(transcript_path, transcript_oss_key, "text/plain; charset=utf-8")
         upsert_recording(
             recording_id=recording_id, device_id=safe_device_id, audio_sha256=expected_sha256,
             original_name=safe_name, source=safe_source, recording_time=parsed_recording_time,
             duration_ms=duration_ms, app_version=app_version,
-            audio_path=audio_path, transcript_path=transcript_path,
+            audio_path=audio_storage_path, transcript_path=transcript_storage_path,
+            audio_size_bytes=audio_size,
+            transcript_size_bytes=transcript_size,
         )
         logger.info(
-            "recording upload success recordingId=%s deviceId=%s audioBytes=%s transcriptBytes=%s",
-            recording_id, safe_device_id, audio_size, transcript_size,
+            "recording upload success recordingId=%s deviceId=%s audioBytes=%s transcriptBytes=%s oss=%s",
+            recording_id, safe_device_id, audio_size, transcript_size, oss_enabled(),
         )
         return {"recording_id": recording_id, "upload_status": "uploaded"}
     except HTTPException:

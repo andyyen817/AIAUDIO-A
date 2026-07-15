@@ -23,6 +23,28 @@ Configure these values in the Zeabur service dashboard:
     MAX_AUDIO_BYTES=2147483648
     MAX_TRANSCRIPT_BYTES=10485760
 
+For Alibaba Cloud OSS storage, also configure:
+
+    ALIYUN_OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
+    ALIYUN_OSS_BUCKET=<bucket name>
+    ALIYUN_OSS_ACCESS_KEY_ID=<RAM access key id>
+    ALIYUN_OSS_ACCESS_KEY_SECRET=<RAM access key secret>
+    ALIYUN_OSS_PREFIX=lightasr
+    OSS_REQUIRED=true
+
+Use the regional endpoint, not the bucket domain. For a cn-hangzhou bucket, use
+https://oss-cn-hangzhou.aliyuncs.com.
+
+For Alibaba Cloud RDS PostgreSQL, set DATABASE_URL to the public or private RDS
+connection string:
+
+    DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<database>
+    DATABASE_REQUIRED=true
+
+If the app still runs on Zeabur, use the RDS public endpoint and configure the
+RDS IP whitelist accordingly. If the app runs inside Alibaba Cloud VPC, prefer
+the RDS internal endpoint.
+
 Mount a persistent volume at /data/lightasr. The upload is not production-ready
 until a WAV and TXT remain available after a Zeabur redeploy.
 

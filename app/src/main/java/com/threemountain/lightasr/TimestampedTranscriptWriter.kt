@@ -39,7 +39,6 @@ object TimestampedTranscriptWriter {
         segmentationMode: String,
         stats: TranscriptionStats,
         transcriptSegments: List<TimestampedTranscriptSegment>,
-        mergedText: String,
     ): String {
         val formatter = absoluteFormatter(recordingTimeContext.timezoneId)
         val recordingStart = formatter.format(Date(recordingTimeContext.recordingStartEpochMs))
@@ -49,10 +48,9 @@ object TimestampedTranscriptWriter {
             appendLine("录音开始时间：$recordingStart")
             appendLine("录音开始时间来源：${recordingTimeContext.source}")
             appendLine("时区：${recordingTimeContext.timezoneId}")
-            appendLine("识别模式：chunked-large-wav-speechgate-fine-vad")
-            appendLine("输出模式：absolute-time-table-transcript")
+            appendLine("识别模式：local-asr-natural-utterance-vad")
+            appendLine("输出模式：relative-time-table-one-natural-utterance-per-row")
             appendLine("时间戳来源：${timestampSourceSummary(transcriptSegments)}")
-            appendLine("说话人：unknown")
             appendLine("音频时长：${"%.2f".format(Locale.US, durationSec)} 秒")
             appendLine("采样率：$sampleRate Hz")
             appendLine("声道数：$channels")
@@ -63,9 +61,9 @@ object TimestampedTranscriptWriter {
             appendLine("总时长：${formatRelativeTimestamp(stats.totalDurationMs * 1000L)}")
             appendLine("检测到的人声时长：${formatRelativeTimestamp(stats.speechDurationMs * 1000L)}")
             appendLine("跳过的无人声时长：${formatRelativeTimestamp(stats.skippedNoSpeechDurationMs * 1000L)}")
-            appendLine("总 chunk 数量：${stats.totalChunks}")
-            appendLine("送入 ASR 的 chunk 数量：${stats.speechChunks}")
-            appendLine("跳过的 chunk 数量：${stats.skippedChunks}")
+            appendLine("自然话语数量：${stats.totalChunks}")
+            appendLine("送入 ASR 的话语数量：${stats.speechChunks}")
+            appendLine("跳过的话语数量：${stats.skippedChunks}")
             appendLine("ASR 实际处理时长：${formatRelativeTimestamp(stats.asrProcessedDurationMs * 1000L)}")
             appendLine()
             appendLine("| 开始时间 | 结束时间 | 说话人 | 内容 |")
@@ -76,17 +74,13 @@ object TimestampedTranscriptWriter {
             } else {
                 transcriptSegments.forEach { segment ->
                     appendLine(
-                        "| ${formatter.format(Date(segment.absoluteStartEpochMs))} " +
-                            "| ${formatter.format(Date(segment.absoluteEndEpochMs))} " +
+                        "| ${formatRelativeTimestamp(segment.relativeStartUs)} " +
+                            "| ${formatRelativeTimestamp(segment.relativeEndUs)} " +
                             "| ${escapeTableCell(segment.speaker)} " +
                             "| ${escapeTableCell(segment.text)} |"
                     )
                 }
             }
-
-            appendLine()
-            appendLine("合并稿：")
-            appendLine(mergedText)
         }
     }
 
@@ -100,7 +94,7 @@ object TimestampedTranscriptWriter {
         return transcriptSegments.joinToString("\n") { segment ->
             "[${formatter.format(Date(segment.absoluteStartEpochMs))} - " +
                 "${formatter.format(Date(segment.absoluteEndEpochMs))}] " +
-                "${segment.speaker}: ${segment.text}"
+                segment.text
         }
     }
 

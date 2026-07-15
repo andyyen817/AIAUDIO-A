@@ -34,6 +34,10 @@ data class SpeechGateConfig(
     val minSpeechRatio: Float = 0.03f,
     val speechPadMs: Long = 300L,
     val mergeGapMs: Long = 500L,
+    val modelMinSilenceDurationSec: Float = 0.25f,
+    val modelMinSpeechDurationSec: Float = 0.25f,
+    val modelMaxSpeechDurationSec: Float = 15.0f,
+    val modelWindowSize: Int = 512,
 )
 
 class SpeechGate(
@@ -47,10 +51,10 @@ class SpeechGate(
             sileroVadModelConfig = SileroVadModelConfig(
                 model = config.modelAssetPath,
                 threshold = config.threshold,
-                minSilenceDuration = 0.25f,
-                minSpeechDuration = 0.25f,
-                windowSize = 512,
-                maxSpeechDuration = 15.0f,
+                minSilenceDuration = config.modelMinSilenceDurationSec,
+                minSpeechDuration = config.modelMinSpeechDurationSec,
+                windowSize = config.modelWindowSize,
+                maxSpeechDuration = config.modelMaxSpeechDurationSec,
             ),
             sampleRate = config.targetSampleRate,
             numThreads = 1,
@@ -65,7 +69,9 @@ class SpeechGate(
             "VAD initialized model=${config.modelAssetPath}, sampleRate=${config.targetSampleRate}, " +
                 "threshold=${config.threshold}, minSpeechMs=${config.minSpeechMs}, " +
                 "minSpeechRatio=${config.minSpeechRatio}, speechPadMs=${config.speechPadMs}, " +
-                "mergeGapMs=${config.mergeGapMs}"
+                "mergeGapMs=${config.mergeGapMs}, modelMinSilenceSec=${config.modelMinSilenceDurationSec}, " +
+                "modelMinSpeechSec=${config.modelMinSpeechDurationSec}, " +
+                "modelMaxSpeechSec=${config.modelMaxSpeechDurationSec}"
         )
     }
 
@@ -87,23 +93,25 @@ class SpeechGate(
             resampleLinear(samples, sampleRate, config.targetSampleRate)
         }
 
-        vad.reset()
-        vad.acceptWaveform(vadSamples)
-        vad.flush()
-
         val rawSegments = mutableListOf<SpeechSegment>()
-        while (!vad.empty()) {
-            val segment = vad.front()
-            val relativeStartMs = samplesToMs(segment.start, config.targetSampleRate)
-            val relativeEndMs = samplesToMs(segment.start + segment.samples.size, config.targetSampleRate)
-            if (relativeEndMs > relativeStartMs) {
-                rawSegments += SpeechSegment(
-                    startMs = (chunkStartMs + relativeStartMs).coerceAtLeast(chunkStartMs),
-                    endMs = (chunkStartMs + relativeEndMs).coerceAtMost(chunkStartMs + chunkDurationMs),
-                )
-            }
-            vad.pop()
+        vad.reset()
+        val frame = FloatArray(config.modelWindowSize)
+        var sampleOffset = 0
+        while (sampleOffset < vadSamples.size) {
+            val frameEnd = min(sampleOffset + config.modelWindowSize, vadSamples.size)
+            frame.fill(0.0f)
+            vadSamples.copyInto(
+                destination = frame,
+                destinationOffset = 0,
+                startIndex = sampleOffset,
+                endIndex = frameEnd,
+            )
+            vad.acceptWaveform(frame)
+            drainDetectedSegments(rawSegments, chunkStartMs, chunkDurationMs)
+            sampleOffset = frameEnd
         }
+        vad.flush()
+        drainDetectedSegments(rawSegments, chunkStartMs, chunkDurationMs)
         vad.clear()
 
         val paddedAndMerged = mergeSpeechSegments(
@@ -144,10 +152,33 @@ class SpeechGate(
 
     private fun runInitSmokeTest() {
         vad.reset()
-        vad.acceptWaveform(FloatArray(512))
+        vad.acceptWaveform(FloatArray(config.modelWindowSize))
         vad.flush()
         vad.clear()
         vad.reset()
+    }
+
+    private fun drainDetectedSegments(
+        output: MutableList<SpeechSegment>,
+        chunkStartMs: Long,
+        chunkDurationMs: Long,
+    ) {
+        while (!vad.empty()) {
+            val segment = vad.front()
+            val relativeStartMs = samplesToMs(segment.start, config.targetSampleRate)
+            val relativeEndMs = samplesToMs(
+                segment.start + segment.samples.size,
+                config.targetSampleRate,
+            )
+            if (relativeEndMs > relativeStartMs) {
+                output += SpeechSegment(
+                    startMs = (chunkStartMs + relativeStartMs).coerceAtLeast(chunkStartMs),
+                    endMs = (chunkStartMs + relativeEndMs)
+                        .coerceAtMost(chunkStartMs + chunkDurationMs),
+                )
+            }
+            vad.pop()
+        }
     }
 
     private fun mergeSpeechSegments(
