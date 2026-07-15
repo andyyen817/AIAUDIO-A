@@ -4,7 +4,9 @@
 
 Version 0.2.0 provides local PCM WAV and AIREC import, streaming VAD + ASR,
 foreground long-task notification, per-chunk checkpoint, task history, and manual
-WAV + TXT upload.
+WAV + TXT upload. Newer APKs use OSS direct upload: Zeabur signs short-lived
+OSS PUT URLs, the phone uploads WAV + TXT directly to OSS, and Zeabur records
+metadata in RDS after upload completion.
 
 Voiceprint remains experimental and is not written into the official transcript.
 Server-side business analysis is not included.
@@ -56,6 +58,9 @@ database readiness and the recording storage path.
 In the App server section, enter the public HTTPS URL and the same token configured
 as Zeabur UPLOAD_TOKEN. The token is kept in App-private SharedPreferences and is
 not committed to Git.
+
+No additional Zeabur variables are required for OSS direct upload. It reuses the
+existing ALIYUN_OSS_* values already required by the server.
 
 ## Release signing
 

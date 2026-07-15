@@ -20,6 +20,7 @@ except ImportError:  # Local file-only tests do not require PostgreSQL.
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 
 
 logging.basicConfig(
@@ -35,12 +36,29 @@ SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 CHUNK_SIZE = 1024 * 1024
 DEFAULT_MAX_AUDIO_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_MAX_TRANSCRIPT_BYTES = 10 * 1024 * 1024
+DEFAULT_SIGNED_URL_EXPIRES_SECONDS = 15 * 60
 
 app = FastAPI(title="LightASR Upload Receiver", version="0.2.0")
 database_status = "disabled"
 database_error: Optional[str] = None
 oss_status = "disabled"
 oss_error: Optional[str] = None
+
+
+class DirectUploadInitRequest(BaseModel):
+    original_name: str
+    source: str
+    recording_time: Optional[str] = None
+    duration_ms: Optional[int] = None
+    audio_sha256: str
+    app_version: Optional[str] = None
+    device_id: str
+    audio_size_bytes: int
+    transcript_size_bytes: int
+
+
+class DirectUploadCompleteRequest(DirectUploadInitRequest):
+    recording_id: str
 
 
 def incoming_root() -> Path:
@@ -130,6 +148,10 @@ def max_transcript_bytes() -> int:
     return int(os.getenv("MAX_TRANSCRIPT_BYTES", str(DEFAULT_MAX_TRANSCRIPT_BYTES)))
 
 
+def signed_url_expires_seconds() -> int:
+    return int(os.getenv("OSS_SIGNED_URL_EXPIRES_SECONDS", str(DEFAULT_SIGNED_URL_EXPIRES_SECONDS)))
+
+
 def is_allowed_sn(sn: str) -> bool:
     allow_all = os.getenv("ALLOW_ALL_SN", "true").lower() in {"1", "true", "yes"}
     if allow_all:
@@ -190,6 +212,83 @@ def ensure_inside_root(root: Path, candidate: Path) -> None:
         candidate.resolve().relative_to(root)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invalid save path") from exc
+
+
+def require_oss_bucket():
+    if not oss_enabled():
+        raise HTTPException(status_code=503, detail="oss is not configured")
+    if oss_status != "ready":
+        raise HTTPException(status_code=503, detail=f"oss is not ready: {oss_error or oss_status}")
+    bucket = oss_bucket()
+    assert bucket is not None
+    return bucket
+
+
+def validate_recording_sizes(audio_size_bytes: int, transcript_size_bytes: int) -> None:
+    if audio_size_bytes <= 44:
+        raise HTTPException(status_code=400, detail="audio_size_bytes must be a non-empty wav size")
+    if audio_size_bytes > max_audio_bytes():
+        raise HTTPException(status_code=413, detail="audio file is too large")
+    if transcript_size_bytes <= 0:
+        raise HTTPException(status_code=400, detail="transcript_size_bytes must be positive")
+    if transcript_size_bytes > max_transcript_bytes():
+        raise HTTPException(status_code=413, detail="transcript file is too large")
+
+
+def recording_storage(
+    safe_name: str,
+    safe_device_id: str,
+    recording_id: str,
+) -> tuple[Path, Path, str, str, str, str]:
+    root = analyzed_recordings_root()
+    target_dir = (root / safe_device_id / recording_id).resolve()
+    audio_path = (target_dir / safe_name).resolve()
+    transcript_name = f"{Path(safe_name).stem}.txt"
+    transcript_path = (target_dir / transcript_name).resolve()
+    for path in (target_dir, audio_path, transcript_path):
+        ensure_inside_root(root, path)
+    audio_oss_key = build_oss_key("recordings", safe_device_id, recording_id, safe_name)
+    transcript_oss_key = build_oss_key("recordings", safe_device_id, recording_id, transcript_name)
+    bucket_name = os.getenv("ALIYUN_OSS_BUCKET", "").strip()
+    audio_storage_path = f"oss://{bucket_name}/{audio_oss_key}" if oss_enabled() else str(audio_path)
+    transcript_storage_path = (
+        f"oss://{bucket_name}/{transcript_oss_key}" if oss_enabled() else str(transcript_path)
+    )
+    return audio_path, transcript_path, audio_oss_key, transcript_oss_key, audio_storage_path, transcript_storage_path
+
+
+def signed_put_target(bucket, oss_key: str, content_type: str) -> dict:
+    headers = {"Content-Type": content_type}
+    url = bucket.sign_url("PUT", oss_key, signed_url_expires_seconds(), headers=headers)
+    return {
+        "method": "PUT",
+        "url": url,
+        "oss_key": oss_key,
+        "content_type": content_type,
+        "headers": headers,
+    }
+
+
+def oss_object_size(bucket, oss_key: str) -> Optional[int]:
+    meta = bucket.get_object_meta(oss_key)
+    headers = getattr(meta, "headers", {}) or {}
+    value = None
+    for key in ("Content-Length", "content-length"):
+        if key in headers:
+            value = headers[key]
+            break
+    if value is None and hasattr(meta, "content_length"):
+        value = getattr(meta, "content_length")
+    return int(value) if value is not None else None
+
+
+def ensure_oss_object(bucket, oss_key: str, expected_size: int, label: str) -> None:
+    try:
+        actual_size = oss_object_size(bucket, oss_key)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"{label} is not available in oss") from exc
+    if actual_size is not None and actual_size != expected_size:
+        raise HTTPException(status_code=409, detail=f"{label} size does not match uploaded object")
 
 
 def require_database_driver() -> None:
@@ -289,8 +388,8 @@ def upsert_recording(
     recording_time: Optional[datetime],
     duration_ms: Optional[int],
     app_version: Optional[str],
-    audio_path: Path,
-    transcript_path: Path,
+    audio_path: str | Path,
+    transcript_path: str | Path,
     audio_size_bytes: int,
     transcript_size_bytes: int,
 ) -> None:
@@ -503,21 +602,22 @@ async def upload_analyzed_recording(
 
     recording_id = recording_id_for(safe_device_id, expected_sha256)
     root = analyzed_recordings_root()
-    target_dir = (root / safe_device_id / recording_id).resolve()
-    audio_path = (target_dir / safe_name).resolve()
-    transcript_path = (target_dir / f"{Path(safe_name).stem}.txt").resolve()
-    audio_oss_key = build_oss_key("recordings", safe_device_id, recording_id, safe_name)
-    transcript_oss_key = build_oss_key(
-        "recordings", safe_device_id, recording_id, f"{Path(safe_name).stem}.txt",
+    (
+        audio_path,
+        transcript_path,
+        audio_oss_key,
+        transcript_oss_key,
+        audio_storage_path,
+        transcript_storage_path,
+    ) = recording_storage(
+        safe_name=safe_name,
+        safe_device_id=safe_device_id,
+        recording_id=recording_id,
     )
-    bucket_name = os.getenv("ALIYUN_OSS_BUCKET", "").strip()
-    audio_storage_path = Path(f"oss://{bucket_name}/{audio_oss_key}") if oss_enabled() else audio_path
-    transcript_storage_path = (
-        Path(f"oss://{bucket_name}/{transcript_oss_key}") if oss_enabled() else transcript_path
-    )
+    target_dir = audio_path.parent
     audio_part = Path(f"{audio_path}.part")
     transcript_part = Path(f"{transcript_path}.part")
-    for path in (target_dir, audio_path, transcript_path, audio_part, transcript_part):
+    for path in (audio_part, transcript_part):
         ensure_inside_root(root, path)
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -578,6 +678,87 @@ async def upload_analyzed_recording(
         transcript_part.unlink(missing_ok=True)
         logger.exception("recording upload failed recordingId=%s error=%s", recording_id, exc)
         raise HTTPException(status_code=500, detail="recording upload failed") from exc
+
+
+@app.post("/api/v1/recordings/direct-upload/init")
+def init_direct_recording_upload(
+    request: DirectUploadInitRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> dict:
+    validate_upload_token(authorization)
+    bucket = require_oss_bucket()
+    safe_name, safe_device_id, expected_sha256, safe_source = validate_recording_fields(
+        request.original_name, request.device_id, request.audio_sha256, request.source,
+    )
+    validate_recording_sizes(request.audio_size_bytes, request.transcript_size_bytes)
+    if request.duration_ms is not None and request.duration_ms < 0:
+        raise HTTPException(status_code=400, detail="duration_ms must be non-negative")
+    parse_recording_time(request.recording_time)
+
+    recording_id = recording_id_for(safe_device_id, expected_sha256)
+    _, _, audio_oss_key, transcript_oss_key, _, _ = recording_storage(
+        safe_name=safe_name,
+        safe_device_id=safe_device_id,
+        recording_id=recording_id,
+    )
+    expires_in = signed_url_expires_seconds()
+    logger.info(
+        "direct upload initialized recordingId=%s deviceId=%s audioBytes=%s transcriptBytes=%s source=%s",
+        recording_id, safe_device_id, request.audio_size_bytes, request.transcript_size_bytes, safe_source,
+    )
+    return {
+        "recording_id": recording_id,
+        "upload_status": "pending_direct_upload",
+        "expires_in_seconds": expires_in,
+        "audio": signed_put_target(bucket, audio_oss_key, "audio/wav"),
+        "transcript": signed_put_target(bucket, transcript_oss_key, "text/plain; charset=utf-8"),
+    }
+
+
+@app.post("/api/v1/recordings/direct-upload/complete")
+def complete_direct_recording_upload(
+    request: DirectUploadCompleteRequest,
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, str]:
+    validate_upload_token(authorization)
+    bucket = require_oss_bucket()
+    safe_name, safe_device_id, expected_sha256, safe_source = validate_recording_fields(
+        request.original_name, request.device_id, request.audio_sha256, request.source,
+    )
+    validate_recording_sizes(request.audio_size_bytes, request.transcript_size_bytes)
+    parsed_recording_time = parse_recording_time(request.recording_time)
+    if request.duration_ms is not None and request.duration_ms < 0:
+        raise HTTPException(status_code=400, detail="duration_ms must be non-negative")
+
+    recording_id = recording_id_for(safe_device_id, expected_sha256)
+    if request.recording_id != recording_id:
+        raise HTTPException(status_code=400, detail="recording_id does not match upload metadata")
+    (
+        _audio_path,
+        _transcript_path,
+        audio_oss_key,
+        transcript_oss_key,
+        audio_storage_path,
+        transcript_storage_path,
+    ) = recording_storage(
+        safe_name=safe_name,
+        safe_device_id=safe_device_id,
+        recording_id=recording_id,
+    )
+    ensure_oss_object(bucket, audio_oss_key, request.audio_size_bytes, "audio_file")
+    ensure_oss_object(bucket, transcript_oss_key, request.transcript_size_bytes, "transcript_file")
+    upsert_recording(
+        recording_id=recording_id, device_id=safe_device_id, audio_sha256=expected_sha256,
+        original_name=safe_name, source=safe_source, recording_time=parsed_recording_time,
+        duration_ms=request.duration_ms, app_version=request.app_version,
+        audio_path=audio_storage_path, transcript_path=transcript_storage_path,
+        audio_size_bytes=request.audio_size_bytes, transcript_size_bytes=request.transcript_size_bytes,
+    )
+    logger.info(
+        "direct recording upload complete recordingId=%s deviceId=%s audioBytes=%s transcriptBytes=%s",
+        recording_id, safe_device_id, request.audio_size_bytes, request.transcript_size_bytes,
+    )
+    return {"recording_id": recording_id, "upload_status": "uploaded"}
 
 
 @app.get("/api/v1/recordings/{recording_id}")

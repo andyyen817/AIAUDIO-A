@@ -22,6 +22,8 @@ recording intake. It is focused on offline WAV transcription on Android devices.
 - Persistent transcription task history, checkpoint files, manual resume, and
   foreground notifications for long local jobs.
 - Manual upload of completed WAV + TXT results to the LightASR server endpoint.
+  Newer APKs request short-lived OSS upload URLs from the server and upload
+  WAV + TXT directly to Alibaba Cloud OSS before the server records metadata.
 - Voiceprint MVP UI and local employee/sample management are present for testing.
 
 ## Not Yet Complete
@@ -89,6 +91,8 @@ GET  /health
 GET  /ready
 POST /api/airec/upload
 POST /api/v1/recordings
+POST /api/v1/recordings/direct-upload/init
+POST /api/v1/recordings/direct-upload/complete
 GET  /api/v1/recordings/{recording_id}
 ```
 
@@ -155,6 +159,12 @@ The server returns HTTP 200 with `ok` when the upload is saved or when the same
 It uploads the original WAV plus the generated UTF-8 TXT transcript. If
 `UPLOAD_TOKEN` is configured on the server, the Android app must send the same
 token as a Bearer token.
+
+`POST /api/v1/recordings/direct-upload/init` and
+`POST /api/v1/recordings/direct-upload/complete` are used by newer APKs. The
+server signs short-lived OSS PUT URLs with the existing `ALIYUN_OSS_*`
+environment variables, the phone uploads files directly to OSS, and the server
+then writes the final RDS metadata record.
 
 ## Notes
 
