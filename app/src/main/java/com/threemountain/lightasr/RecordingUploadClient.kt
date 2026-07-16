@@ -119,8 +119,9 @@ class RecordingUploadClient(private val config: LightAsrServerConfig) {
         val init = parseDirectUploadInit(initJson)
         val totalFileBytes = audioFile.length() + transcriptFile.length()
         var sentFileBytes = 0L
+        val transcriptUploadName = audioFile.name.substringBeforeLast('.', audioFile.name) + ".txt"
 
-        onStage("直传音频到 OSS：${formatBytes(audioFile.length())}")
+        onStage("直传音频到 OSS：${audioFile.name} · ${formatBytes(audioFile.length())}")
         sentFileBytes += putFileToSignedUrl(
             target = init.audio,
             file = audioFile,
@@ -128,7 +129,7 @@ class RecordingUploadClient(private val config: LightAsrServerConfig) {
             alreadySent = sentFileBytes,
             onProgress = onProgress,
         )
-        onStage("直传 TXT 到 OSS：${formatBytes(transcriptFile.length())}")
+        onStage("直传同名 TXT 到 OSS：$transcriptUploadName · ${formatBytes(transcriptFile.length())}")
         sentFileBytes += putFileToSignedUrl(
             target = init.transcript,
             file = transcriptFile,

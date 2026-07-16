@@ -795,7 +795,7 @@ class MainActivity : ComponentActivity() {
                 TranscriptionJobStatus.UPLOADING -> "${job.errorMessage ?: "上传中"} $progress%"
                 TranscriptionJobStatus.UPLOADED -> "上传成功：${job.serverRecordingId ?: "服务器已接收"}"
                 TranscriptionJobStatus.UPLOAD_FAILED -> job.errorMessage ?: "上传失败"
-                TranscriptionJobStatus.LOCAL_COMPLETED -> "TXT 已生成，可上传 WAV 和 TXT"
+                TranscriptionJobStatus.LOCAL_COMPLETED -> "将上传原始 WAV 和同名 TXT"
                 else -> "本地分析完成后才可上传"
             }
             textSize = 14f
@@ -820,7 +820,7 @@ class MainActivity : ComponentActivity() {
         val children = mutableListOf<View>(statusBox, uploadProgressBar)
         if (canUpload) {
             children += Button(this).apply {
-                text = if (job.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传" else "上传到服务器"
+                text = if (job.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传 WAV+TXT" else "上传 WAV+TXT"
                 stylePrimaryButton(this)
                 isEnabled = activeTranscriptionJobId == null
                 setOnClickListener { uploadJob(job.id) }
@@ -1000,8 +1000,8 @@ class MainActivity : ComponentActivity() {
         val uploadText = when (uploadedJob?.status) {
             TranscriptionJobStatus.UPLOADED -> "已上传：${uploadedJob.serverRecordingId ?: "服务器已接收"}"
             TranscriptionJobStatus.UPLOADING -> "${uploadedJob.errorMessage ?: "上传中"}：${uploadedJob.progressPercent}%"
-            TranscriptionJobStatus.UPLOAD_FAILED -> "上次上传失败，可重试"
-            else -> "TXT 已生成，可将 WAV 和 TXT 上传服务器归档"
+            TranscriptionJobStatus.UPLOAD_FAILED -> "上次上传失败，可重试上传原始 WAV 和同名 TXT"
+            else -> "将上传原始 WAV 和同名 TXT 到 OSS，并在服务器登记记录"
         }
         val progress = uploadedJob?.progressPercent?.coerceIn(0, 100) ?: 0
         val statusBox = TextView(this).apply {
@@ -1009,7 +1009,7 @@ class MainActivity : ComponentActivity() {
                 TranscriptionJobStatus.UPLOADING -> "${uploadedJob.errorMessage ?: "上传进度"} $progress%"
                 TranscriptionJobStatus.UPLOADED -> "上传进度 100%"
                 TranscriptionJobStatus.UPLOAD_FAILED -> uploadedJob.errorMessage ?: "上传失败"
-                else -> if (state.jobId == null) "内置测试音频不创建上传任务" else "等待上传"
+                else -> if (state.jobId == null) "内置测试音频不创建上传任务" else "等待上传 WAV+TXT"
             }
             textSize = 14f
             setInfoBoxStyle(
@@ -1034,7 +1034,7 @@ class MainActivity : ComponentActivity() {
         val jobId = state.jobId
         if (jobId != null) {
             children += Button(this).apply {
-                text = if (uploadedJob?.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传" else "上传到服务器"
+                text = if (uploadedJob?.status == TranscriptionJobStatus.UPLOAD_FAILED) "重新上传 WAV+TXT" else "上传 WAV+TXT"
                 stylePrimaryButton(this)
                 isEnabled = uploadedJob?.status != TranscriptionJobStatus.UPLOADING
                 setOnClickListener { uploadJob(jobId) }
@@ -2399,7 +2399,8 @@ AIREC 接收模式：$stateText
         refreshJobHistoryUi()
         refreshResultPageIfVisible()
         refreshJobDetailPageIfVisible()
-        setStatus("正在上传 WAV 和 TXT...")
+        val uploadTxtName = audio.name.substringBeforeLast('.', audio.name) + ".txt"
+        setStatus("正在上传：${audio.name} + $uploadTxtName")
 
         thread(name = "upload-job-" + job.id.take(8)) {
             var lastProgress = -1
@@ -2429,7 +2430,7 @@ AIREC 接收模式：$stateText
                             )
                         }.onFailure { Log.w(TAG, "upload foreground progress failed", it) }
                         runOnUiThread {
-                            setStatus("正在上传 WAV 和 TXT... $progress%")
+                            setStatus("正在上传：${audio.name} + $uploadTxtName  $progress%")
                             refreshJobHistoryUi()
                             refreshResultPageIfVisible()
                             refreshJobDetailPageIfVisible()
