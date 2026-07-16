@@ -577,6 +577,7 @@ class MainActivity : ComponentActivity() {
     private fun showHomePage() {
         currentPage = LightAsrPage.HOME
         activeJobDetailId = null
+        pageRoot.contentDescription = LightAsrPage.HOME.name
         pageRoot.removeAllViews()
         pageRoot.addView(buildHomeHeader(), matchWrap())
         pageRoot.addView(buildStatusCard(), sectionWrap())
@@ -600,6 +601,7 @@ class MainActivity : ComponentActivity() {
     private fun showVoiceprintPage() {
         currentPage = LightAsrPage.VOICEPRINT
         activeJobDetailId = null
+        pageRoot.contentDescription = LightAsrPage.VOICEPRINT.name
         pageRoot.removeAllViews()
         pageRoot.addView(buildVoiceprintHeader(), matchWrap())
         pageRoot.addView(
@@ -637,6 +639,7 @@ class MainActivity : ComponentActivity() {
         currentPage = LightAsrPage.RESULT
         activeJobDetailId = null
         latestResultPageState = state
+        pageRoot.contentDescription = LightAsrPage.RESULT.name
         pageRoot.removeAllViews()
         pageRoot.addView(buildResultHeader(), matchWrap())
         pageRoot.addView(buildResultCompleteCard(state), sectionWrap())
@@ -655,6 +658,7 @@ class MainActivity : ComponentActivity() {
         }
         currentPage = LightAsrPage.JOB_DETAIL
         activeJobDetailId = job.id
+        pageRoot.contentDescription = LightAsrPage.JOB_DETAIL.name
         pageRoot.removeAllViews()
         pageRoot.addView(buildJobDetailHeader(), matchWrap())
         pageRoot.addView(buildJobDetailInfoCard(job), sectionWrap())
@@ -664,12 +668,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleAppBack() {
-        if (currentPage == LightAsrPage.HOME) {
-            Log.i(TAG, "finish app from home back")
-            finish()
-        } else {
-            goHomeFromSubpage("system back from $currentPage")
+        val page = visiblePage()
+        if (page != LightAsrPage.HOME) {
+            goHomeFromSubpage("system back from $page")
+            return
         }
+        Log.i(TAG, "finish app from home back")
+        finish()
     }
 
     @Deprecated("Use OnBackPressedDispatcher on newer Android versions")
@@ -680,6 +685,13 @@ class MainActivity : ComponentActivity() {
     private fun goHomeFromSubpage(reason: String) {
         Log.i(TAG, "navigate home: $reason")
         showHomePage()
+    }
+
+    private fun visiblePage(): LightAsrPage {
+        val tagPage = pageRoot.contentDescription
+            ?.toString()
+            ?.let { value -> LightAsrPage.values().firstOrNull { it.name == value } }
+        return tagPage ?: currentPage
     }
 
     private fun scrollCurrentPageToTop() {
