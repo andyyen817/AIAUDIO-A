@@ -24,8 +24,6 @@ import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.window.OnBackInvokedCallback
-import android.window.OnBackInvokedDispatcher
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -332,7 +330,6 @@ class MainActivity : ComponentActivity() {
     private var latestResultPageState: ResultPageState? = null
     private var activeJobDetailId: String? = null
     private var currentPage: LightAsrPage = LightAsrPage.HOME
-    private var platformBackCallback: OnBackInvokedCallback? = null
     private var pendingTxtExportPath: String? = null
     private val localSemanticCorrector: LocalSemanticCorrector by lazy {
         runCatching {
@@ -376,7 +373,6 @@ class MainActivity : ComponentActivity() {
                 }
             },
         )
-        registerPlatformBackCallback()
         refreshAirecReceiverUi()
         refreshSharedImportRecordsUi()
         refreshJobHistoryUi()
@@ -669,29 +665,10 @@ class MainActivity : ComponentActivity() {
 
     private fun handleAppBack() {
         if (currentPage == LightAsrPage.HOME) {
+            Log.i(TAG, "finish app from home back")
             finish()
         } else {
             goHomeFromSubpage("system back from $currentPage")
-        }
-    }
-
-    private fun registerPlatformBackCallback() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val callback = OnBackInvokedCallback { handleAppBack() }
-            platformBackCallback = callback
-            onBackInvokedDispatcher.registerOnBackInvokedCallback(
-                OnBackInvokedDispatcher.PRIORITY_DEFAULT,
-                callback,
-            )
-        }
-    }
-
-    private fun unregisterPlatformBackCallback() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            platformBackCallback?.let { callback ->
-                onBackInvokedDispatcher.unregisterOnBackInvokedCallback(callback)
-            }
-            platformBackCallback = null
         }
     }
 
@@ -5365,7 +5342,6 @@ ASR 实际处理时长：${formatTxtTimestamp(stats.asrProcessedDurationMs)}
     }
 
     override fun onDestroy() {
-        unregisterPlatformBackCallback()
         if (activeTranscriptionJobId == null) {
             recognizer?.release()
             recognizer = null
